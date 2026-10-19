@@ -2,19 +2,29 @@ import { app, BrowserWindow, ipcMain, safeStorage, dialog, shell } from 'electro
 import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { readFile, stat } from 'node:fs/promises';
+import { readFile, stat, copyFile, mkdir } from 'node:fs/promises';
 import { AccountService } from './service.mjs';
 import { discoverCli, discoverDesktop } from './windows.mjs';
 import { safeError } from './core.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
+// This dashboard has no GPU-heavy content; software rendering avoids a large idle GPU allocation.
+app.disableHardwareAcceleration();
 const smoke = !app.isPackaged && process.env.ACCOUNT_DECK_SMOKE === '1';
+const legacyDirectory = app.getPath('userData');
+const profileDirectory = app.commandLine.getSwitchValue('user-data-dir');
+app.setPath('userData', profileDirectory && path.isAbsolute(profileDirectory) ? profileDirectory : path.join(app.getPath('appData'), 'codex-account-deck'));
 if (smoke) app.setPath('userData', path.join(os.tmpdir(), 'codex-deck-ui-test'));
 if (!app.requestSingleInstanceLock()) { app.quit(); } else {
   let win, service, quitting = false;
   app.on('second-instance', () => { if (win) { win.show(); win.focus(); } });
   app.whenReady().then(async () => {
-  const defaults = { cliPath: await discoverCli(), desktopPath: await discoverDesktop(), codexHome: process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), pollSeconds: 60, autoSync: true };
+  // Preserve existing encrypted data if an older build derived userData from a different product name.
+  if (!profileDirectory && !smoke && legacyDirectory !== app.getPath('userData')) {
+    await mkdir(app.getPath('userData'), { recursive: true });
+    await copyFile(path.join(legacyDirectory, 'accounts.vault'), path.join(app.getPath('userData'), 'accounts.vault'), 1).catch(error => { if (!['ENOENT', 'EEXIST'].includes(error.code)) throw error; });
+  }
+  const defaults = { cliPath: smoke ? await discoverCli() : '', desktopPath: smoke ? await discoverDesktop() : '', codexHome: process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), pollSeconds: 120, autoSync: true, lowResource: true, cliAutoDetect: true, desktopAutoDetect: true };
   service = new AccountService({ directory: app.getPath('userData'), crypto: safeStorage, defaults });
   if (smoke) {
     const { installSmoke } = await import('../tests/ui-fixture.mjs');
@@ -32,7 +42,13 @@ if (!app.requestSingleInstanceLock()) { app.quit(); } else {
     win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
     win.webContents.on('will-navigate', (event, url) => { if (!allowed(url)) event.preventDefault(); });
     win.webContents.session.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
-    service.on('changed', () => { if (!win.isDestroyed()) win.webContents.send('deck:changed'); });
+    let changeTimer;
+    service.on('changed', () => {
+      if (changeTimer || win.isDestroyed() || !win.isVisible() || win.isMinimized()) return;
+      changeTimer = setTimeout(() => { changeTimer = null; if (!win.isDestroyed()) win.webContents.send('deck:changed'); }, 200);
+    });
+    const visibility = () => { if (!smoke) service.setBackground(!win.isVisible() || win.isMinimized()); };
+    for (const event of ['show', 'hide', 'minimize', 'restore']) win.on(event, visibility);
     ipcMain.handle('deck:action', async (event, action, args = {}) => {
       try {
         if (event.sender !== win.webContents || event.senderFrame !== win.webContents.mainFrame || !allowed(event.senderFrame.url)) throw new Error('拒绝来自未知页面的请求。');
@@ -61,6 +77,7 @@ if (!app.requestSingleInstanceLock()) { app.quit(); } else {
           case 'remove': await service.remove(args.id); break;
           case 'rename': await service.rename(args.id, args.label); break;
           case 'settings': await service.updateSettings(args); break;
+          case 'redetect': await service.redetect(); break;
           case 'workflowThreads': value = await service.workflow.threads(); break;
           case 'workflowCreate': value = await service.workflow.create(args); break;
           case 'workflowStart': await service.workflow.start(args.id); break;

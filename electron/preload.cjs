@@ -9,6 +9,7 @@ contextBridge.exposeInMainWorld('deck', {
   switch: (id, restart) => invoke('switch', { id, restart }),
   remove: id => invoke('remove', { id }), rename: (id, label) => invoke('rename', { id, label }),
   settings: patch => invoke('settings', patch), pick: kind => invoke('pick', { kind }),
+  redetect: () => invoke('redetect'),
   restore: () => invoke('restore'),
   workflowThreads: () => invoke('workflowThreads'), workflowCreate: input => invoke('workflowCreate', input),
   workflowStart: id => invoke('workflowStart', { id }), workflowPause: id => invoke('workflowPause', { id }),

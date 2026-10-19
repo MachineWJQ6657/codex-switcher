@@ -61,13 +61,23 @@ export class Vault {
     } else this.data = { version: 1, accounts: [], settings: defaults, events: [], backup: null };
     return this.data;
   }
-  async save() { await atomicWrite(this.file, this.crypto.encryptString(JSON.stringify(this.data))); }
+  save() {
+    const operation = (this.saving ?? Promise.resolve()).then(async () => {
+      const serialized = JSON.stringify(this.data);
+      const hash = digest(serialized);
+      if (hash === this.savedHash) return;
+      await atomicWrite(this.file, this.crypto.encryptString(serialized));
+      this.savedHash = hash;
+    });
+    this.saving = operation.catch(() => {});
+    return operation;
+  }
 }
 export class SerialQueue {
   tail = Promise.resolve();
   run(fn) { const result = this.tail.then(fn); this.tail = result.catch(() => {}); return result; }
 }
-export function safeError(error) {
+export function safeError(error, maxLength = 500) {
   const message = error instanceof Error ? error.message : String(error);
-  return message.replace(/(?:eyJ[A-Za-z0-9_-]+\.)[A-Za-z0-9_.-]+/g, '[已隐藏凭据]').replace(/(?:sk-|rt_)[A-Za-z0-9_-]{8,}/g, '[已隐藏凭据]').slice(0, 500);
+  return message.replace(/(?:eyJ[A-Za-z0-9_-]+\.)[A-Za-z0-9_.-]+/g, '[已隐藏凭据]').replace(/(?:sk-|rt_)[A-Za-z0-9_-]{8,}/g, '[已隐藏凭据]').slice(0, maxLength);
 }

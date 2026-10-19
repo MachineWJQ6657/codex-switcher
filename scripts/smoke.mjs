@@ -53,7 +53,8 @@ for (const empty of [false, true]) {
     await page.getByRole('button', { name: '客户端设置', exact: true }).click();
     await page.getByRole('heading', { name: '本机连接' }).waitFor();
     await page.getByRole('switch', { name: '自动同步额度' }).click();
-    assert.equal(await page.getByRole('switch').getAttribute('aria-checked'), 'false');
+    assert.equal(await page.getByRole('switch', { name: '自动同步额度' }).getAttribute('aria-checked'), 'false');
+    assert.equal(await page.getByRole('switch', { name: '低资源模式' }).getAttribute('aria-checked'), 'true');
     await page.screenshot({ path: path.join(output, empty ? 'empty-settings.png' : 'settings.png'), fullPage: true });
     await page.getByRole('button', { name: '操作记录', exact: true }).click();
     await page.getByRole('heading', { name: '最近操作' }).waitFor();

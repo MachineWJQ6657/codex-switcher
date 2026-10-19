@@ -31,15 +31,33 @@ export class WorkflowEngine {
     for (const w of this.all) if (IN_FLIGHT.has(w.status)) { w.status = 'needs_attention'; w.message = '上次运行意外中断，请核对会话和文件后手动继续。不会自动重放已提交的操作。'; }
     await this.service.vault.save();
   }
-  schedule() { this.timer = setInterval(() => this.tick().catch(() => {}), 15000); }
+  schedule() {
+    clearTimeout(this.timer);
+    const w = this.active;
+    if (this.service.stopping || !w || !['monitoring', 'waiting'].includes(w.status)) return;
+    const low = this.service.data.settings.lowResource;
+    let delay = low ? 60000 : 15000;
+    if (low && w.status === 'waiting') {
+      const resets = w.accountIds.flatMap(id => {
+        const a = this.service.data.accounts.find(a => a.id === id);
+        if (!a || a.error || !a.syncedAt) return [];
+        return (a.limits.find(b => b.id === w.bucketId)?.windows ?? []).filter(x => x.remaining === 0 && x.resetsAt).map(x => x.resetsAt * 1000 - Date.now());
+      }).filter(x => x > 0);
+      if (resets.length === w.accountIds.length) delay = Math.max(60000, Math.min(300000, Math.min(...resets)));
+    }
+    this.timer = setTimeout(() => this.tick().catch(() => {}), delay);
+  }
   async persist(w, status, message) {
-    w.status = status; w.message = message; w.updatedAt = Date.now();
+    if (w.status !== status || w.message !== message) w.updatedAt = Date.now();
+    w.status = status; w.message = message;
     await this.service.vault.save(); this.service.publish();
+    this.schedule(); this.service.schedule();
   }
   find(id) { const w = this.all.find(x => x.id === id); if (!w) throw new Error('工作流不存在。'); return w; }
   async history(method, params) {
     // Read persisted metadata without joining or starting a turn on the desktop's live server.
-    const s = this.service, rpc = new s.Rpc(s.data.settings.cliPath, s.data.settings.codexHome, { ephemeral: true });
+    const s = this.service; await s.refreshRuntimePaths();
+    const rpc = new s.Rpc(s.data.settings.cliPath, s.data.settings.codexHome, { ephemeral: true });
     s.sessions.add(rpc);
     try { await rpc.initialize(); return await rpc.call(method, params); }
     finally { await rpc.close(); s.sessions.delete(rpc); }
@@ -94,7 +112,7 @@ export class WorkflowEngine {
     const w = this.active; if (!w || !['monitoring', 'waiting'].includes(w.status)) return;
     this.busy = true; const generation = this.generation;
     try {
-      await this.service.syncAll();
+      await this.service.syncAll(w.accountIds, true);
       if (generation !== this.generation) return;
       if (w.status === 'monitoring') {
         const target = await this.service.target();
@@ -114,7 +132,7 @@ export class WorkflowEngine {
       await this.run(w, account, generation);
     } catch (error) {
       if (generation === this.generation) { await this.stopRunner(); await this.persist(w, 'needs_attention', safeError(error)); }
-    } finally { this.busy = false; }
+    } finally { this.busy = false; this.schedule(); }
   }
   cooldown(w, a) {
     const windows = a.limits.find(b => b.id === w.bucketId)?.windows ?? [];
@@ -137,7 +155,7 @@ export class WorkflowEngine {
     if (w.accountId && w.accountId !== account.id) w.switchCount++;
     w.accountId = account.id;
     const rpc = new s.Rpc(s.data.settings.cliPath, w.home);
-    const runner = { rpc, workflowId: w.id, generation, approval: null, completed: [], ready: false };
+    const runner = { rpc, workflowId: w.id, generation, approval: null, completed: [], ready: false, changes: new Map() };
     this.runner = runner; s.sessions.add(rpc);
     rpc.on('notification', msg => this.notification(runner, msg));
     rpc.on('request', msg => this.request(runner, msg));
@@ -168,9 +186,10 @@ export class WorkflowEngine {
     if (this.runner !== runner || runner.generation !== this.generation) return;
     const w = this.find(runner.workflowId), p = msg.params ?? {};
     if (p.threadId && p.threadId !== w.threadId) return;
+    if (['item/started', 'item/completed'].includes(msg.method) && p.item?.type === 'fileChange') runner.changes.set(p.item.id, p.item.changes);
     if (msg.method === 'item/agentMessage/delta') {
-      w.output = safeError(new Error(`${w.output}${String(p.delta ?? '')}`)).slice(-500);
-      this.service.publish();
+      w.output = safeError(`${w.output}${String(p.delta ?? '')}`, 12000).slice(-6000);
+      if (!runner.outputTimer) runner.outputTimer = setTimeout(() => { runner.outputTimer = null; this.service.publish(); }, this.service.data.settings.lowResource ? 1000 : 250);
     }
     if (msg.method !== 'turn/completed') return;
     if (!runner.ready) { runner.completed.push(msg); return; }
@@ -198,9 +217,15 @@ export class WorkflowEngine {
     if (this.runner !== runner) return;
     const w = this.find(runner.workflowId);
     if (['item/commandExecution/requestApproval', 'item/fileChange/requestApproval'].includes(msg.method)) {
+      if (runner.approval) {
+        runner.rpc.send({ id: msg.id, error: { code: -32000, message: 'Another approval is pending; pause and inspect before continuing.' } });
+        this.pause(w.id).then(() => this.persist(w, 'needs_attention', '出现多个并发审批，请在原客户端核对后继续。')).catch(() => {}); return;
+      }
       const decisions = msg.params?.availableDecisions;
-      const accept = !decisions || decisions.includes('accept');
-      runner.approval = { requestId: msg.id, method: msg.method, command: safeError(msg.params?.command || msg.params?.reason || '请求写入文件'), cwd: msg.params?.cwd || w.cwd, canAccept: accept };
+      const files = runner.changes.get(msg.params?.itemId);
+      const command = msg.method === 'item/fileChange/requestApproval' ? files?.map(f => `${f.path}\n${f.diff}`).join('\n\n') : msg.params?.command;
+      const accept = (!decisions || decisions.includes('accept')) && typeof command === 'string' && command.length <= 20000;
+      runner.approval = { requestId: msg.id, method: msg.method, command: safeError(command || '未获得完整的操作预览，请拒绝后回原客户端核对。', 20000), cwd: msg.params?.cwd || w.cwd, canAccept: accept };
       this.persist(w, 'approval', '执行需要你的审批，请检查命令或文件写入请求。').catch(() => {});
     } else {
       runner.rpc.send({ id: msg.id, error: { code: -32601, message: 'Workflow host cannot handle this interactive or host-specific tool. Return to the original client.' } });
@@ -217,12 +242,13 @@ export class WorkflowEngine {
   async stopRunner(interrupt = true) {
     const r = this.runner; if (!r) return;
     this.runner = null;
+    clearTimeout(r.outputTimer);
     const w = this.find(r.workflowId);
     if (interrupt && w.turnId && !r.finishing) await r.rpc.call('turn/interrupt', { threadId: w.threadId, turnId: w.turnId }, 5000).catch(() => {});
     await r.rpc.close(); this.service.sessions.delete(r.rpc);
   }
   async dispose() {
-    clearInterval(this.timer); this.generation++;
+    clearTimeout(this.timer); this.generation++;
     const w = this.active;
     await this.stopRunner();
     if (w && IN_FLIGHT.has(w.status)) await this.persist(w, 'needs_attention', '应用已退出，执行已中断；请核对项目后手动继续。');

@@ -54,3 +54,14 @@ test('queue serializes errors without breaking subsequent operations', async () 
   await assert.rejects(() => first); await second; assert.deepEqual(order, ['start', 'end', 'second']);
   assert.ok(!safeError(new Error(`bad ${JSON.parse(fixtureAuth()).tokens.id_token}`)).includes('.test'));
 });
+test('unchanged vault data skips encryption and filesystem rewrites', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'deck-vault-cache-'));
+  const crypto = testCrypto(); let encryptions = 0;
+  const original = crypto.encryptString; crypto.encryptString = value => { encryptions++; return original(value); };
+  try {
+    const vault = new Vault(path.join(root, 'vault'), crypto); await vault.load({});
+    await vault.save(); await vault.save(); await Promise.all([vault.save(), vault.save()]);
+    assert.equal(encryptions, 1);
+    vault.data.events.push({ message: 'changed' }); await vault.save(); assert.equal(encryptions, 2);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});

@@ -22,6 +22,10 @@ export class AccountService extends EventEmitter {
   async init() {
     await mkdir(this.directory, { recursive: true });
     await this.vault.load(this.defaults);
+    this.data.settings.lowResource ??= true;
+    this.data.settings.cliAutoDetect ??= !this.data.settings.cliPath || /[/\\]OpenAI[/\\]Codex[/\\]bin[/\\]/i.test(this.data.settings.cliPath);
+    this.data.settings.desktopAutoDetect ??= !this.data.settings.desktopPath || /[/\\]OpenAI\.Codex_[^/\\]+[/\\]/i.test(this.data.settings.desktopPath);
+    await this.refreshRuntimePaths(true);
     this.data.workflows ??= [];
     await this.workflow.recover();
     // Recover only our own disposable session folders after a crash.
@@ -34,9 +38,32 @@ export class AccountService extends EventEmitter {
     this.workflow.schedule();
   }
   schedule() {
-    clearInterval(this.timer);
-    this.timer = setInterval(() => { if (!this.login && this.data.settings.autoSync) this.syncAll().catch(() => {}); }, this.data.settings.pollSeconds * 1000);
+    clearTimeout(this.timer);
+    if (this.stopping || !this.data.accounts.length || !this.data.settings.autoSync || this.workflow.active) return;
+    const interval = this.background && this.data.settings.lowResource ? Math.max(300, this.data.settings.pollSeconds) : this.data.settings.pollSeconds;
+    this.timer = setTimeout(async () => {
+      try { if (!this.login) await this.syncAll(); } catch { /* Per-account errors appear on cards. */ }
+      finally { this.schedule(); }
+    }, interval * 1000);
   }
+  setBackground(value) { this.background = value; this.schedule(); }
+  async refreshRuntimePaths(force = false) {
+    if (!force && Date.now() - (this.pathsCheckedAt ?? 0) < 60000) return;
+    this.pathsCheckedAt = Date.now();
+    const settings = this.data.settings;
+    let changed = false;
+    for (const [key, auto, discover] of [['cliPath', 'cliAutoDetect', 'discoverCli'], ['desktopPath', 'desktopAutoDetect', 'discoverDesktop']]) {
+      if (!settings[auto] || typeof this.platform[discover] !== 'function') continue;
+      const detected = await this.platform[discover]();
+      if (detected && detected !== settings[key]) { settings[key] = detected; changed = true; }
+    }
+    if (changed) { await this.vault.save(); this.publish(); }
+  }
+  redetect() { return this.queue.run(async () => {
+    this.workflow.assertOwnership(null);
+    this.data.settings.cliAutoDetect = true; this.data.settings.desktopAutoDetect = true;
+    await this.refreshRuntimePaths(true); await this.vault.save(); this.publish();
+  }); }
   async target() {
     try {
       const raw = await readFile(path.join(this.data.settings.codexHome, 'auth.json'), 'utf8');
@@ -65,7 +92,7 @@ export class AccountService extends EventEmitter {
       this.data.accounts.push(account);
     }
     this.event(`已保存账号「${account.label}」`);
-    await this.vault.save(); this.publish(); return account.id;
+    await this.vault.save(); this.schedule(); this.publish(); return account.id;
   }
   importCurrent() { return this.queue.run(async () => {
     const current = await this.target();
@@ -77,6 +104,7 @@ export class AccountService extends EventEmitter {
   remove(id) { return this.queue.run(async () => { if (this.workflow.usesAccount(id)) throw new Error('该账号正在工作流候选池中，请先暂停或移除工作流。'); const a = this.find(id); this.data.accounts = this.data.accounts.filter(x => x.id !== id); this.event(`已移除「${a.label}」`); await this.vault.save(); this.publish(); }); }
   find(id) { const a = this.data.accounts.find(x => x.id === id); if (!a) throw new Error('账号不存在。'); return a; }
   async session(auth, { ephemeral = false } = {}) {
+    await this.refreshRuntimePaths();
     const executable = this.data.settings.cliPath;
     if (!executable) throw new Error('未检测到 Codex CLI，请在设置中选择 codex.exe。');
     const home = await mkdtemp(path.join(this.directory, '.sessions', 'session-'));
@@ -132,16 +160,19 @@ export class AccountService extends EventEmitter {
     }
     this.publish();
   }
-  syncAll(onlyId) {
+  syncAll(onlyId, dueOnly = false) {
     if (this.syncPromise) return this.syncPromise;
-    this.syncPromise = this.performSync(onlyId).finally(() => { this.syncPromise = null; });
+    this.syncPromise = this.performSync(onlyId, dueOnly).finally(() => { this.syncPromise = null; });
     return this.syncPromise;
   }
-  performSync(onlyId) { return this.queue.run(async () => {
+  performSync(onlyId, dueOnly = false) { return this.queue.run(async () => {
     if (this.stopping) return;
+    const ids = Array.isArray(onlyId) ? onlyId : onlyId ? [onlyId] : null;
+    const pending = this.data.accounts.filter(a => (!ids || ids.includes(a.id)) && (!dueOnly || !a.syncedAt || Date.now() - a.syncedAt >= this.data.settings.pollSeconds * 1000));
+    if (!pending.length) return;
     this.syncing = true; this.publish();
     try {
-      for (const account of this.data.accounts.filter(a => !onlyId || a.id === onlyId)) {
+      for (const account of pending) {
         if (this.stopping) break;
         let session;
         try {
@@ -181,6 +212,7 @@ export class AccountService extends EventEmitter {
   switchAccount(id, restart = true, workflowId = null) { return this.queue.run(async () => {
     this.workflow.assertOwnership(workflowId);
     if (workflowId && this.workflow.active?.id !== workflowId) throw new Error('工作流已暂停，切换已取消。');
+    await this.refreshRuntimePaths();
     const account = this.find(id);
     const { settings } = this.data;
     await this.checkTargetConfig();
@@ -235,10 +267,13 @@ export class AccountService extends EventEmitter {
         if (typeof patch[key] !== 'string' || !path.isAbsolute(patch[key]) || patch[key].length > 1024) throw new Error('请选择有效的绝对路径。');
         if (key !== 'codexHome') { if (path.extname(patch[key]).toLowerCase() !== '.exe') throw new Error('请选择 .exe 程序。'); await access(patch[key]); }
         next[key] = path.resolve(patch[key]);
+        if (key === 'cliPath') next.cliAutoDetect = false;
+        if (key === 'desktopPath') next.desktopAutoDetect = false;
       }
     }
     if ('pollSeconds' in patch) { if (!Number.isInteger(patch.pollSeconds) || patch.pollSeconds < 30 || patch.pollSeconds > 3600) throw new Error('同步间隔应为 30–3600 秒。'); next.pollSeconds = patch.pollSeconds; }
     if ('autoSync' in patch) next.autoSync = Boolean(patch.autoSync);
+    if ('lowResource' in patch) next.lowResource = Boolean(patch.lowResource);
     if (next.codexHome !== this.data.settings.codexHome) this.data.backup = null;
     this.data.settings = next; await this.vault.save(); this.schedule(); this.publish();
   }); }

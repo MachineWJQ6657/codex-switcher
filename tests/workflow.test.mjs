@@ -102,3 +102,12 @@ test('unsupported host tool pauses instead of fabricating execution result', asy
   rpc.emit('request', { id: 88, method: 'item/tool/call', params: {} });
   await until(() => w.status === 'needs_attention'); assert.equal(rpc.sent[0].error.code, -32601); assert.equal(engine.runner, null);
 });
+test('idle and executing workflows have no polling timer; incomplete approval preview cannot be accepted', async t => {
+  const { engine, w } = await setup(t); engine.schedule(); assert.ok(!engine.timer);
+  await engine.start(w.id); await until(() => w.status === 'running' && !engine.busy);
+  engine.schedule(); assert.ok(!engine.timer || engine.timer._destroyed);
+  engine.runner.rpc.emit('request', { id: 99, method: 'item/fileChange/requestApproval', params: { itemId: 'unknown' } });
+  await until(() => w.status === 'approval');
+  assert.equal(engine.snapshot()[0].approval.canAccept, false);
+  await assert.rejects(() => engine.approve(w.id, 99, true), /未提供/);
+});

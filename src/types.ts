@@ -1,7 +1,7 @@
 export type LimitWindow = { key: string; used: number | null; remaining: number | null; minutes: number | null; resetsAt: number | null };
 export type Bucket = { id: string; name: string; plan: string | null; windows: LimitWindow[]; credits?: { hasCredits?: boolean; unlimited?: boolean; balance?: string | number | null } | null };
 export type Account = { id: string; label: string; email: string | null; accountId: string; plan: string; isTarget: boolean; limits: Bucket[]; syncedAt: number | null; error: string | null; addedAt: number };
-export type Settings = { cliPath: string; desktopPath: string; codexHome: string; pollSeconds: number; autoSync: boolean };
+export type Settings = { cliPath: string; desktopPath: string; codexHome: string; pollSeconds: number; autoSync: boolean; lowResource: boolean; cliAutoDetect: boolean; desktopAutoDetect: boolean };
 export type Workflow = { id: string; name: string; mode: 'new' | 'existing'; cwd: string; threadId: string | null; prompt: string; accountIds: string[]; bucketId: string; status: string; message: string; accountId: string | null; turnId: string | null; switchCount: number; output: string; updatedAt: number; approval: { requestId: string | number; command: string; cwd: string; canAccept: boolean } | null };
 export type WorkflowInput = { name: string; mode: 'new' | 'existing'; cwd: string; prompt: string; threadId: string; bucketId: string; accountIds: string[] };
 export type LocalThread = { id: string; name: string; cwd: string };
@@ -14,6 +14,7 @@ export interface DeckAPI {
   sync(id?: string): Promise<Result>; switch(id: string, restart: boolean): Promise<Result<{ message: string }>>;
   remove(id: string): Promise<Result>; rename(id: string, label: string): Promise<Result>; restore(): Promise<Result>;
   settings(patch: Partial<Settings>): Promise<Result>; pick(kind: string): Promise<Result<string | null>>;
+  redetect(): Promise<Result>;
   workflowThreads(): Promise<Result<LocalThread[]>>; workflowCreate(input: WorkflowInput): Promise<Result>;
   workflowStart(id: string): Promise<Result>; workflowPause(id: string): Promise<Result>; workflowRemove(id: string): Promise<Result>;
   workflowApprove(id: string, requestId: string | number, accept: boolean): Promise<Result>;

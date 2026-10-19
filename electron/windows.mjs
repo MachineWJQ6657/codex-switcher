@@ -1,6 +1,6 @@
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
-import { access, readdir } from 'node:fs/promises';
+import { access, readdir, stat } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 const exec = promisify(execFile);
@@ -18,13 +18,13 @@ export async function discoverCli() {
     const dirs = await readdir(root, { withFileTypes: true });
     const candidates = await Promise.all(dirs.filter(x => x.isDirectory()).map(async d => {
       const file = path.join(root, d.name, 'codex.exe');
-      try { await access(file); return file; } catch { return null; }
+      try { return { file, updated: (await stat(file)).mtimeMs }; } catch { return null; }
     }));
     // The running desktop's backend is preferred to a leftover updater version.
     const running = await powershell("Get-Process codex -ErrorAction SilentlyContinue | ForEach-Object { $_.Path } | Select-Object -Unique | ConvertTo-Json -Compress");
-    const found = running ? [JSON.parse(running)].flat().find(x => candidates.includes(x)) : null;
+    const found = running ? [JSON.parse(running)].flat().find(x => candidates.some(c => c?.file === x)) : null;
     if (found) return found;
-    if (candidates.filter(Boolean).length) return candidates.filter(Boolean).at(-1);
+    if (candidates.filter(Boolean).length) return candidates.filter(Boolean).sort((a, b) => b.updated - a.updated)[0].file;
   } catch { /* Fall through to PATH. */ }
   try {
     const result = await powershell("(Get-Command codex.exe -ErrorAction Stop).Source");

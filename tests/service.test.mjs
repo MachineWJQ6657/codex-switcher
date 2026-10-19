@@ -88,3 +88,31 @@ test('browser OAuth completion persists credentials and cleans temporary home', 
   assert.equal(service.data.accounts[0].label, 'OAuth Test'); assert.equal(service.data.accounts[0].email, 'oauth-person@example.test');
   assert.deepEqual(await readdir(path.join(root, 'data', '.sessions')), []);
 });
+test('due-only sync refreshes selected expired accounts and reuses fresh quota without another CLI', async t => {
+  const { service } = await setup(t);
+  const one = await service.importFile(fixtureAuth('one')), two = await service.importFile(fixtureAuth('two'));
+  await service.syncAll([one], true); assert.equal(FakeRpc.instances.length, 1);
+  await service.syncAll([one], true); assert.equal(FakeRpc.instances.length, 1);
+  assert.equal(service.find(two).syncedAt, null);
+  service.find(one).syncedAt = Date.now() - 61000;
+  await service.syncAll([one], true); assert.equal(FakeRpc.instances.length, 2);
+});
+test('empty account list schedules no background polling', async t => {
+  const { service } = await setup(t); service.data.settings.autoSync = true; service.schedule();
+  assert.ok(!service.timer);
+});
+test('official installation paths follow updates, custom overrides stay local and credentials survive reload', async t => {
+  const { service, root } = await setup(t);
+  const id = await service.importFile(fixtureAuth('persistent'));
+  const newExe = path.join(root, 'updated.exe'); await writeFile(newExe, 'fixture-new');
+  service.data.settings.cliAutoDetect = true; service.data.settings.desktopAutoDetect = true;
+  service.platform.discoverCli = async () => newExe; service.platform.discoverDesktop = async () => newExe;
+  await service.refreshRuntimePaths(true);
+  assert.equal(service.data.settings.cliPath, newExe); assert.equal(service.data.settings.desktopPath, newExe);
+  const custom = path.join(root, 'custom.exe'); await writeFile(custom, 'custom');
+  await service.updateSettings({ cliPath: custom }); await service.refreshRuntimePaths(true);
+  assert.equal(service.data.settings.cliPath, custom); assert.equal(service.data.settings.cliAutoDetect, false);
+  const restored = await service.vault.load({});
+  assert.equal(restored.accounts[0].id, id); assert.equal(restored.accounts[0].auth.tokens.refresh_token, 'fixture-refresh');
+  assert.equal(restored.settings.cliPath, custom);
+});
