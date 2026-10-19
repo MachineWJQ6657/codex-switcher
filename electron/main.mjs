@@ -89,6 +89,7 @@ if (!app.requestSingleInstanceLock()) { app.quit(); } else {
           case 'settings': await service.updateSettings(args); break;
           case 'redetect': await service.redetect(); break;
           case 'workflowThreads': value = await service.workflow.threads(); break;
+          case 'workflowOpen': await service.workflow.open(args.id); break;
           case 'workflowCreate': value = await service.workflow.create(args); break;
           case 'workflowStart': await service.workflow.start(args.id); break;
           case 'workflowPause': await service.workflow.pause(args.id); break;

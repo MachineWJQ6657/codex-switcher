@@ -1,6 +1,6 @@
 {
   "name": "codex-account-deck",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "private": true,
   "description": "A local, encrypted account switcher for Codex on Windows",
   "type": "module",
@@ -18,7 +18,7 @@
     "appId": "local.codex.accountdeck",
     "productName": "Codex Account Deck",
     "directories": {
-      "output": "release/0.4.0"
+      "output": "release/0.4.1"
     },
     "files": [
       "dist/**/*",

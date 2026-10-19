@@ -16,6 +16,7 @@ export interface DeckAPI {
   settings(patch: Partial<Settings>): Promise<Result>; pick(kind: string): Promise<Result<string | null>>;
   redetect(): Promise<Result>;
   workflowThreads(): Promise<Result<LocalThread[]>>; workflowCreate(input: WorkflowInput): Promise<Result>;
+  workflowOpen(id: string): Promise<Result>;
   workflowStart(id: string): Promise<Result>; workflowPause(id: string): Promise<Result>; workflowRemove(id: string): Promise<Result>;
   workflowApprove(id: string, requestId: string | number, accept: boolean): Promise<Result>;
   onChanged(callback: () => void): () => void;

@@ -12,6 +12,7 @@ contextBridge.exposeInMainWorld('deck', {
   redetect: () => invoke('redetect'),
   restore: () => invoke('restore'),
   workflowThreads: () => invoke('workflowThreads'), workflowCreate: input => invoke('workflowCreate', input),
+  workflowOpen: id => invoke('workflowOpen', { id }),
   workflowStart: id => invoke('workflowStart', { id }), workflowPause: id => invoke('workflowPause', { id }),
   workflowRemove: id => invoke('workflowRemove', { id }), workflowApprove: (id, requestId, accept) => invoke('workflowApprove', { id, requestId, accept }),
   onChanged: callback => { const listener = () => callback(); ipcRenderer.on('deck:changed', listener); return () => ipcRenderer.removeListener('deck:changed', listener); }

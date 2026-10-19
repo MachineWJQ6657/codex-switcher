@@ -64,7 +64,7 @@ export default function App() {
         <button className={page === 'workflow' ? 'nav-item active' : 'nav-item'} onClick={() => setPage('workflow')}><Zap size={18}/>自动工作流</button>
         <button className={page === 'settings' ? 'nav-item active' : 'nav-item'} onClick={() => setPage('settings')}><Settings2 size={18}/>客户端设置</button>
       </nav>
-      <div className="sidebar-bottom"><div className="local-note"><ShieldCheck size={19}/><div>凭据仅保存在本机<small>由 Windows 系统加密保护</small></div></div><button className="nav-item" onClick={() => setModal('help')}><CircleHelp size={18}/>使用说明 <ArrowUpRight size={15}/></button><div className="version"><span className="dot green"/>桌面客户端 <span>v0.4.0</span></div></div>
+      <div className="sidebar-bottom"><div className="local-note"><ShieldCheck size={19}/><div>凭据仅保存在本机<small>由 Windows 系统加密保护</small></div></div><button className="nav-item" onClick={() => setModal('help')}><CircleHelp size={18}/>使用说明 <ArrowUpRight size={15}/></button><div className="version"><span className="dot green"/>桌面客户端 <span>v0.4.1</span></div></div>
     </aside>
     <main>
       <header className="topbar"><div><span className="breadcrumb">工作空间</span><ChevronRight size={13}/><span>{page === 'accounts' ? '账号总览' : page === 'settings' ? '客户端设置' : page === 'workflow' ? '自动工作流' : '操作记录'}</span></div><span className="local-pill"><span className="dot green"/>本地运行</span></header>

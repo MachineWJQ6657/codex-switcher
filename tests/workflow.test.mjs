@@ -1,207 +1,206 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { AccountService } from '../electron/service.mjs';
-import { quotaState, quotaError, selectAutomaticTarget, pendingExecution } from '../electron/workflow.mjs';
+import { quotaError, quotaState, nextAccount, observedEntry } from '../electron/workflow.mjs';
 import { fixtureAuth, testCrypto } from './helpers.mjs';
+const id = '01a15651-9fa2-7291-a6ff-b9def0813806';
+const otherId = '01a15651-9fa2-7291-a6ff-b9def0813807';
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 async function until(fn) { for (let i = 0; i < 200; i++) { if (fn()) return; await sleep(10); } throw new Error('condition timed out'); }
-const threadId = '01a15651-9fa2-7291-a6ff-b9def0813806';
 async function setup(t, status = 'interrupted') {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'deck-workflow-'));
-  const home = path.join(root, 'target'); await mkdir(home);
-  const exe = path.join(root, 'fixture.exe'); await writeFile(exe, 'test');
-  const thread = { id: threadId, cwd: home, originator: 'Codex Desktop', name: 'Original task', updatedAt: Math.floor(Date.now() / 1000) };
+  const root = await mkdtemp(path.join(os.tmpdir(), 'deck-monitor-')), home = path.join(root, 'target'); await mkdir(home);
+  const exe = path.join(root, 'client.exe'); await writeFile(exe, 'fixture');
+  const thread = { id, cwd: home, originator: 'Codex Desktop', name: 'Original project task', updatedAt: Math.floor(Date.now() / 1000) };
   class Rpc extends EventEmitter {
-    static instances = []; static turn = { id: 'old-turn', status, startedAt: Math.floor(Date.now() / 1000), items: [] };
-    static queue = []; static legacy = false; static offline = false; static unreadableSibling = false;
-    constructor(_exe, _home, options) { super(); this.calls = []; this.options = options; Rpc.instances.push(this); }
+    static calls = []; static queue = []; static legacy = false; static offline = false;
+    static threads = [thread]; static turn = { id: 'original-turn', status, startedAt: Math.floor(Date.now() / 1000) - 10, completedAt: null, items: [] };
+    static otherTurn = { id: 'other-turn', status: 'interrupted', startedAt: Math.floor(Date.now() / 1000) - 60, completedAt: null, items: [] };
+    constructor(_exe, _home, options) { super(); assert.equal(options.ephemeral, true); }
     async initialize() {}
-    async close() { this.closed = true; }
+    async close() {}
     async call(method, params) {
-      this.calls.push({ method, params });
-      if (Rpc.offline) throw new Error('fixture temporary connection failure');
-      if (['thread/resume', 'turn/start', 'thread/start', 'thread/queue/start'].includes(method)) throw new Error('Account Deck must NEVER execute a task');
-      if (method === 'thread/read') return { thread: { ...thread, turns: [Rpc.turn] } };
-      if (method === 'thread/list') return { data: Rpc.unreadableSibling ? [{ ...thread, id: 'broken-sibling' }, thread] : [thread] };
-      if (method === 'thread/turns/list') {
-        if (params.threadId === 'broken-sibling') throw new Error('fixture invalid rollout');
-        if (Rpc.legacy) throw new Error('list_turns is not supported yet');
-        return { data: [Rpc.turn] };
-      }
+      Rpc.calls.push({ method, params }); if (Rpc.offline) throw new Error('temporary connection failure');
+      if (['thread/resume', 'thread/start', 'turn/start', 'thread/queue/start'].includes(method)) throw new Error('Forbidden independent task execution');
+      if (method === 'thread/list') return { data: Rpc.threads };
+      if (method === 'thread/read') return { thread: { ...(Rpc.threads.find(t => t.id === params.threadId) || thread), turns: [params.threadId === otherId ? Rpc.otherTurn : Rpc.turn] } };
+      if (method === 'thread/turns/list') { if (Rpc.legacy) throw new Error('list_turns is not supported yet'); return { data: [params.threadId === otherId ? Rpc.otherTurn : Rpc.turn] }; }
       if (method === 'thread/queue/list') return { data: Rpc.queue };
-      if (method === 'thread/queue/add') { const queuedSubmission = { ...params, id: 'queued-fixture' }; Rpc.queue.push(queuedSubmission); return { queuedSubmission }; }
+      if (method === 'thread/queue/add') { const queuedSubmission = { ...params, id: 'queued-id' }; Rpc.queue.push(queuedSubmission); return { queuedSubmission }; }
+      if (method === 'thread/queue/delete') { Rpc.queue = Rpc.queue.filter(q => q.id !== params.queuedSubmissionId); return {}; }
       return {};
     }
   }
-  const platform = { running: true, log: [], desktopRunning: async () => platform.running,
+  const platform = { held: [], unknown: false, log: [], running: true,
+    threadWriters: async () => ({ busy: [...platform.held], unknown: platform.unknown }),
+    desktopRunning: async () => platform.running,
     closeDesktop: async () => { platform.log.push('close'); platform.running = false; },
-    launchDesktop: async (exe, options) => { platform.log.push({ launch: exe, ...options }); platform.running = true; } };
+    launchDesktop: async (_exe, options) => { platform.log.push({ launch: true, ...options }); platform.running = true; } };
   const service = new AccountService({ directory: path.join(root, 'data'), crypto: testCrypto(), defaults: { cliPath: exe, desktopPath: exe, codexHome: home, autoSync: false, pollSeconds: 3600, lowResource: true }, Rpc, platform });
   await service.init();
   const a = await service.importFile(fixtureAuth('first')), b = await service.importFile(fixtureAuth('second'));
-  function quota(id, remaining) { const a = service.find(id); a.error = null; a.syncedAt = Date.now(); a.limits = [{ id: 'codex', windows: [{ remaining, resetsAt: Math.floor(Date.now() / 1000) + 120, key: 'primary', minutes: 300 }] }]; }
-  quota(a, 70); quota(b, 90);
-  await writeFile(path.join(home, 'auth.json'), JSON.stringify(service.find(a).auth));
+  function quota(accountId, remaining) { Object.assign(service.find(accountId), { error: null, syncedAt: Date.now(), limits: [{ id: 'codex', windows: [{ key: 'primary', remaining, resetsAt: Math.floor(Date.now() / 1000) + 120 }] }] }); }
+  quota(a, 64); quota(b, 100); await writeFile(path.join(home, 'auth.json'), JSON.stringify(service.find(a).auth));
   service.syncAll = async ids => { (service.syncRequests ??= []).push(ids); };
-  const id = await service.workflow.create({ name: 'workflow', mode: 'auto', cwd: '', accountIds: [a, b] });
+  const workflowId = await service.workflow.create({ name: 'automatic', mode: 'auto', cwd: '', accountIds: [a, b] });
+  const w = service.workflow.find(workflowId), engine = service.workflow;
+  const originalSwitch = service.switchAccount.bind(service); service.switches = 0;
+  service.switchAccount = async (...args) => { service.switches++; return originalSwitch(...args); };
   t.after(async () => { await service.dispose(); await rm(root, { recursive: true, force: true }); });
-  return { service, engine: service.workflow, w: service.workflow.find(id), a, b, Rpc, platform, home, quota, thread };
+  return { service, engine, w, a, b, quota, Rpc, platform, thread, home };
 }
-async function start({ engine, w }) { await engine.start(w.id); await until(() => !engine.busy); }
-function executedCalls(Rpc) { return Rpc.instances.flatMap(r => r.calls).filter(c => ['thread/resume', 'turn/start', 'thread/start', 'thread/queue/start'].includes(c.method)); }
+async function start(x) { await x.engine.start(x.w.id); await until(() => !x.engine.busy); }
+function completeOwn(x, status = 'completed') {
+  x.Rpc.turn = { id: 'desktop-turn', status, startedAt: Math.floor(Date.now() / 1000), completedAt: status === 'completed' ? Math.floor(Date.now() / 1000) : null,
+    items: [{ type: 'userMessage', id: 'server-generated-id', clientId: x.w.dispatchId, content: [] }] }; x.Rpc.queue = [];
+}
 
-test('quota errors accept subscription signals but reject generic 429, policy and unknown quotas', () => {
-  assert.equal(quotaError({ codexErrorInfo: 'rateLimitExceeded' }), true);
-  assert.equal(quotaError({ codexErrorInfo: { usageLimitExceeded: {} } }), true);
-  assert.equal(quotaError({ message: "You've hit your usage limit. Try again later." }), true);
-  assert.equal(quotaError({ message: '429 too many requests' }), false);
-  assert.equal(quotaError({ codexErrorInfo: 'contextWindowExceeded' }), false);
-  assert.equal(quotaState({ error: null, syncedAt: Date.now(), limits: [{ id: 'codex', windows: [{ remaining: null }] }] }, 'codex'), 'unknown');
+test('actual snapshot regression: healthy running writer with history interrupted never switches, restarts or enqueues on repeated ticks', async t => {
+  const x = await setup(t); x.platform.held = [id];
+  const before = await readFile(path.join(x.home, 'auth.json'), 'utf8'); await start(x);
+  for (let i = 0; i < 5; i++) await x.engine.tick();
+  assert.equal(x.w.observedTarget.threadId, id); assert.equal(x.w.observedTarget.status, 'inProgress');
+  assert.equal(x.w.status, 'monitoring'); assert.equal(x.service.switches, 0); assert.deepEqual(x.platform.log, []); assert.deepEqual(x.Rpc.queue, []);
+  assert.equal(await readFile(path.join(x.home, 'auth.json'), 'utf8'), before);
 });
 
-test('interrupted work is queued once and immediately reopened in OFFICIAL desktop, never executed by Account Deck', async t => {
-  const x = await setup(t); await start(x);
-  assert.equal(x.w.status, 'running'); assert.equal(x.w.threadId, threadId); assert.equal(x.w.cwd, x.home);
-  assert.equal(x.Rpc.queue.length, 1); assert.match(x.Rpc.queue[0].input[0].text, /不要重复/);
-  assert.equal(x.platform.log[0], 'close'); assert.equal(x.platform.log[1].threadId, threadId);
-  assert.equal(x.platform.log[1].home, x.home); assert.equal(x.platform.running, true);
-  assert.deepEqual(executedCalls(x.Rpc), []);
-  assert.ok(x.Rpc.instances.every(r => r.options.ephemeral && r.closed));
-  assert.ok(x.engine.timer); assert.equal(x.engine.timer._idleTimeout, 15000);
-  await x.engine.tick(); assert.equal(x.Rpc.queue.length, 1);
+test('live task is never preempted by a 0% quota snapshot', async t => {
+  const x = await setup(t, 'inProgress'); x.quota(x.a, 0); await start(x);
+  assert.equal(x.w.status, 'monitoring'); assert.equal(x.service.switches, 0); assert.deepEqual(x.platform.log, []);
 });
 
-test('background TIMER detects exhausted account, switches and restarts official desktop without a manual click', async t => {
+test('ordinary interruption resumes original thread WITHOUT switching, auth writes or closing official desktop, even if another account is first', async t => {
+  const x = await setup(t); x.w.accountIds = [x.b, x.a]; const before = await readFile(path.join(x.home, 'auth.json'), 'utf8'); await start(x);
+  assert.equal(x.w.status, 'resuming'); assert.equal(x.w.accountId, x.a); assert.equal(x.service.switches, 0); assert.equal(x.platform.log.includes('close'), false);
+  assert.equal(x.platform.log[0].threadId, id); assert.equal(x.platform.log[0].home, x.home); assert.equal(x.Rpc.queue.length, 1);
+  assert.equal(await readFile(path.join(x.home, 'auth.json'), 'utf8'), before);
+  for (let i = 0; i < 4; i++) await x.engine.tick();
+  assert.equal(x.Rpc.queue.length, 1); assert.equal(x.platform.log.length, 1); assert.equal(x.w.status, 'resuming');
+});
+
+test('quota switch requires observed original turn failure AND fresh zero, selects a genuinely different account using background timer', async t => {
+  const x = await setup(t, 'inProgress'); await start(x); x.quota(x.a, 0);
+  x.Rpc.turn = { ...x.Rpc.turn, status: 'failed', completedAt: Math.floor(Date.now() / 1000), error: { codexErrorInfo: 'usageLimitExceeded' } };
+  x.engine.timer._onTimeout(); await until(() => !x.engine.busy && x.w.status === 'resuming');
+  assert.equal(x.w.accountId, x.b); assert.equal(x.w.switchCount, 1); assert.equal(x.service.switches, 1);
+  assert.equal(x.platform.log[0], 'close'); assert.equal(x.platform.log[1].threadId, id);
+});
+
+test('historical quota error with healthy current account never switches or restarts', async t => {
   const x = await setup(t, 'inProgress'); await start(x);
-  assert.equal(x.w.status, 'monitoring'); assert.equal(x.platform.log.length, 0);
-  x.quota(x.a, 0);
-  // Execute the installed background timer callback, with no workflowStart or restart action.
-  x.engine.timer._onTimeout();
-  await until(() => x.w.status === 'running' && !x.engine.busy);
-  assert.equal(x.w.accountId, x.b); assert.equal(x.w.switchCount, 1);
-  assert.equal(x.platform.log.at(-1).threadId, threadId); assert.ok(x.w.cooldowns[x.a] > Date.now());
-  assert.deepEqual(executedCalls(x.Rpc), []);
+  x.Rpc.turn = { ...x.Rpc.turn, status: 'failed', error: { codexErrorInfo: 'usageLimitExceeded' } };
+  await x.engine.tick(); assert.equal(x.service.switches, 0); assert.deepEqual(x.platform.log, []); assert.match(x.w.message, /不符/);
 });
 
-test('explicit quota failure switches even if the last successful quota query still shows availability', async t => {
-  const x = await setup(t, 'failed'); x.Rpc.turn.error = { codexErrorInfo: 'usageLimitExceeded' };
-  await start(x); assert.equal(x.w.accountId, x.b); assert.equal(x.w.status, 'running');
+test('unobserved quota failure from an older account cannot be attributed to the current account', async t => {
+  const x = await setup(t, 'failed'); x.Rpc.turn.error = { codexErrorInfo: 'usageLimitExceeded' }; x.quota(x.a, 0); await start(x);
+  assert.equal(x.service.switches, 0); assert.deepEqual(x.platform.log, []); assert.match(x.w.message, /尚未确认/);
 });
 
-test('legacy thread read fallback keeps monitoring and automatically handles its quota failure', async t => {
-  const x = await setup(t, 'failed'); x.Rpc.legacy = true; x.Rpc.turn.error = { codexErrorInfo: 'rateLimitExceeded' };
-  await start(x); assert.equal(x.w.status, 'running'); assert.equal(x.w.accountId, x.b);
-  assert.ok(x.Rpc.instances.some(r => r.calls.some(c => c.method === 'thread/read' && c.params.includeTurns)));
+test('same-account-only candidate pool waits without touching auth or restarting', async t => {
+  const x = await setup(t, 'inProgress'); x.w.accountIds = [x.a]; await start(x); x.quota(x.a, 0);
+  x.Rpc.turn = { ...x.Rpc.turn, status: 'failed', error: { codexErrorInfo: 'usageLimitExceeded' } }; await x.engine.tick();
+  assert.equal(x.w.status, 'waiting'); assert.equal(x.service.switches, 0); assert.deepEqual(x.platform.log, []);
+  const duplicate = { ...x.service.find(x.a), id: 'different-record-same-identity' };
+  assert.equal(nextAccount([duplicate], { accountIds: [duplicate.id], cooldowns: {} }, Date.now(), 60000, x.service.find(x.a)), undefined);
 });
 
-test('transient monitoring errors retain the background timer and recover without pressing restart', async t => {
-  const x = await setup(t, 'inProgress'); x.Rpc.offline = true; await start(x);
-  assert.equal(x.w.status, 'monitoring'); assert.ok(x.engine.timer); assert.match(x.w.message, /自动重试/);
-  x.Rpc.offline = false; x.w.retryAfter = 0; x.quota(x.a, 0);
-  x.engine.timer._onTimeout(); await until(() => x.w.status === 'running' && !x.engine.busy);
-  assert.equal(x.w.accountId, x.b);
+test('active task in another project prevents resuming an old interrupted task, including outside scope', async t => {
+  const x = await setup(t); x.Rpc.threads.push({ ...x.thread, id: otherId, cwd: path.resolve(x.home, '..'), updatedAt: x.thread.updatedAt + 1 });
+  x.platform.held = [otherId]; x.w.scope = x.home; await start(x);
+  assert.deepEqual(x.platform.log, []); assert.equal(x.Rpc.queue.length, 0); assert.equal(x.service.switches, 0);
 });
 
-test('an unreadable sibling does not disable monitoring healthy threads', async t => {
-  const x = await setup(t); x.Rpc.unreadableSibling = true; await start(x);
-  assert.equal(x.w.status, 'running'); assert.equal(x.w.threadId, threadId);
+test('unknown ownership or a live writer makes interruption recovery fail closed', async t => {
+  const x = await setup(t); x.platform.unknown = true; await start(x);
+  assert.equal(x.w.status, 'monitoring'); assert.equal(x.Rpc.queue.length, 0); assert.deepEqual(x.platform.log, []);
 });
 
-test('current-account quota polling ignores a one-hour dashboard sync interval', async t => {
-  const x = await setup(t, 'inProgress'); x.service.find(x.a).syncedAt = Date.now() - 16000;
-  await start(x); assert.deepEqual(x.service.syncRequests[0], [x.a]);
+test('restoration is acknowledged only by matching user message clientId in the SAME thread', async t => {
+  const x = await setup(t); await start(x); assert.equal(x.w.status, 'resuming');
+  completeOwn(x, 'inProgress'); x.platform.held = [id]; await x.engine.tick();
+  assert.equal(x.w.status, 'running'); assert.equal(x.w.following, true); assert.equal(x.w.dispatchId, null);
+  x.Rpc.turn.status = 'interrupted'; // Real persisted history while its writer is still running.
+  await x.engine.tick(); await x.engine.tick();
+  assert.equal(x.w.status, 'running'); assert.equal(x.service.switches, 0); assert.equal(x.platform.log.length, 1);
 });
 
-test('all accounts exhausted waits with official desktop open, then rotates when quota returns', async t => {
-  const x = await setup(t); x.quota(x.a, 0); x.quota(x.b, 0); await start(x);
-  assert.equal(x.w.status, 'waiting'); assert.equal(x.platform.log.length, 0); assert.ok(x.engine.timer);
-  x.quota(x.b, 80); await x.engine.tick(); assert.equal(x.w.status, 'running'); assert.equal(x.w.accountId, x.b);
+test('an unrelated new turn is not false proof of recovery and cancels only our own queued continuation', async t => {
+  const x = await setup(t); await start(x);
+  x.Rpc.queue.push({ id: 'user-followup', clientUserMessageId: 'user-owned-message', input: [] });
+  x.Rpc.turn = { id: 'different-user-turn', status: 'inProgress', items: [{ type: 'userMessage', clientId: 'user-owned-message' }] };
+  await x.engine.tick(); assert.equal(x.w.status, 'needs_attention'); assert.equal(x.w.following, false);
+  assert.deepEqual(x.Rpc.queue.map(q => q.id), ['user-followup']); assert.equal(x.service.switches, 0);
 });
 
-test('existing mode also detects zero quota during a live task instead of requiring a terminal quota error', async t => {
-  const x = await setup(t, 'inProgress'); x.w.mode = 'existing'; x.w.threadId = threadId; x.w.cwd = x.home;
-  x.quota(x.a, 0); await start(x); assert.equal(x.w.status, 'running'); assert.equal(x.w.accountId, x.b);
+test('completed acknowledgement releases the original task only once', async t => {
+  const x = await setup(t); await start(x); completeOwn(x); await x.engine.tick();
+  assert.equal(x.w.completedCount, 1); assert.equal(x.w.status, 'monitoring'); assert.equal(x.w.threadId, null);
+  await x.engine.tick(); assert.equal(x.w.completedCount, 1); assert.equal(x.platform.log.length, 1);
 });
 
-test('active tools are allowed to finish before restarting official desktop', async t => {
-  const x = await setup(t, 'inProgress'); x.quota(x.a, 0); x.Rpc.turn.items = [{ type: 'commandExecution', status: 'inProgress' }];
-  await start(x); assert.equal(x.w.status, 'monitoring'); assert.equal(x.platform.log.length, 0);
-  x.Rpc.turn.items = []; await x.engine.tick(); assert.equal(x.w.status, 'running');
+test('failed wake verification stops without enqueuing again, switching again, or claiming a running task', async t => {
+  const x = await setup(t); await start(x); x.w.dispatchAt = Date.now() - 100000; await x.engine.tick();
+  assert.equal(x.w.status, 'needs_attention'); assert.equal(x.Rpc.queue.length, 1); assert.equal(x.service.switches, 0); assert.equal(x.platform.log.length, 1);
 });
 
-test('completion after selection never submits a duplicate continuation', async t => {
-  const x = await setup(t); const original = x.engine.automaticTarget.bind(x.engine);
-  x.engine.automaticTarget = async w => { const selected = await original(w); x.Rpc.turn = { ...x.Rpc.turn, status: 'completed' }; return selected; };
-  await start(x); assert.equal(x.w.status, 'monitoring'); assert.equal(x.Rpc.queue.length, 0); assert.equal(x.platform.log.length, 0);
+test('a resumed task interrupted again is not repeatedly restarted or submitted', async t => {
+  const x = await setup(t); await start(x); completeOwn(x, 'interrupted'); await x.engine.tick();
+  assert.equal(x.w.status, 'needs_attention'); assert.equal(x.service.switches, 0); assert.equal(x.platform.log.length, 1); assert.equal(x.Rpc.queue.length, 0);
 });
 
-test('desktop completion returns automatic mode to monitoring and preserves official desktop running', async t => {
-  const x = await setup(t); await start(x); x.Rpc.queue = [];
-  x.Rpc.turn = { id: 'desktop-next-turn', status: 'completed', items: [] };
-  await x.engine.tick(); assert.equal(x.w.status, 'monitoring'); assert.equal(x.w.completedCount, 1);
-  assert.equal(x.w.threadId, null); assert.equal(x.platform.running, true);
+test('legacy metadata reading and transient monitoring failures retain non-destructive background checks', async t => {
+  const x = await setup(t); x.Rpc.legacy = true; x.platform.held = [id]; await start(x);
+  assert.equal(x.w.observedTarget.status, 'inProgress'); assert.equal(x.platform.log.length, 0);
+  x.Rpc.offline = true; await x.engine.tick(); assert.equal(x.w.status, 'monitoring'); assert.ok(x.engine.timer);
 });
 
-test('later quota failure inside official desktop triggers another automatic rotation', async t => {
-  const x = await setup(t); await start(x); x.Rpc.queue = [];
-  x.Rpc.turn = { id: 'desktop-next-turn', status: 'failed', items: [], error: { codexErrorInfo: 'usageLimitExceeded' } };
-  await x.engine.tick(); assert.equal(x.w.accountId, x.b); assert.equal(x.w.switchCount, 1);
-  assert.equal(x.platform.log.filter(x => x === 'close').length, 2); assert.deepEqual(executedCalls(x.Rpc), []);
+test('upgrade keeps old automation paused instead of silently re-enabling it', async t => {
+  const x = await setup(t); x.w.policyVersion = undefined; x.w.status = 'monitoring'; x.w.dispatchId = 'stale'; await x.engine.recover();
+  assert.equal(x.w.status, 'paused'); assert.equal(x.w.dispatchId, null); assert.equal(x.w.policyVersion, 2); assert.deepEqual(x.platform.log, []);
 });
 
-test('pause or quit only stops monitoring, leaving official desktop task untouched', async t => {
-  const x = await setup(t); await start(x); const logCount = x.platform.log.length;
+test('pause cancels only unsent automatic message and never stops the official client', async t => {
+  const x = await setup(t); await start(x); x.Rpc.queue.push({ id: 'user-followup', clientUserMessageId: 'user-owned' });
   await x.engine.pause(x.w.id); assert.equal(x.w.status, 'paused'); assert.equal(x.engine.timer, null);
-  assert.equal(x.platform.log.length, logCount); assert.equal(x.platform.running, true); assert.deepEqual(executedCalls(x.Rpc), []);
+  assert.deepEqual(x.Rpc.queue.map(q => q.id), ['user-followup']); assert.equal(x.platform.running, true); assert.equal(x.platform.log.includes('close'), false);
 });
 
-test('persisted desktop queue resumes observation after restart without enqueuing again', async t => {
-  const x = await setup(t); await start(x); const dispatch = x.w.dispatchId;
-  await x.engine.recover(); assert.equal(x.w.status, 'running'); assert.equal(x.w.dispatchId, dispatch);
-  await x.engine.tick(); assert.equal(x.Rpc.queue.length, 1);
+test('no model or tool execution takes place in Account Deck', async t => {
+  const x = await setup(t); await start(x);
+  assert.equal(x.Rpc.calls.some(c => ['thread/start', 'thread/resume', 'turn/start', 'thread/queue/start'].includes(c.method)), false);
 });
 
-test('existing user follow-up is woken without appending another continue instruction', async t => {
-  const x = await setup(t); x.Rpc.queue = [{ id: 'user-queued', clientUserMessageId: 'user-message', input: [] }];
-  await start(x); assert.equal(x.w.dispatchId, 'user-message'); assert.equal(x.Rpc.queue.length, 1);
+test('ownership normalization changes only unfinished interrupted history and preserves explicit terminal errors', () => {
+  const thread = { id }, writers = { busy: [id] };
+  assert.equal(observedEntry(thread, { status: 'interrupted', completedAt: null }, writers).turn.status, 'inProgress');
+  assert.equal(observedEntry(thread, { status: 'interrupted', completedAt: 5 }, writers).turn.status, 'interrupted');
+  assert.equal(observedEntry(thread, { status: 'failed', completedAt: null }, writers).turn.status, 'failed');
+  assert.equal(quotaError({ message: '429 too many requests' }), false);
+  assert.equal(quotaState({ limits: [], syncedAt: Date.now() }, 'codex'), 'unknown');
 });
 
-test('new tasks must be created in official desktop; independent CLI tasks are observed until interrupted', async t => {
-  const x = await setup(t, 'inProgress');
-  await assert.rejects(() => x.engine.create({ name: 'no local runner', mode: 'new', accountIds: [x.a] }), /官方客户端/);
-  x.thread.originator = 'codex_cli_rs'; x.quota(x.a, 0); await start(x);
-  assert.equal(x.w.status, 'monitoring'); assert.equal(x.platform.log.length, 0);
+test('pausing during a slow quota refresh cannot reactivate the workflow', async t => {
+  const x = await setup(t, 'inProgress'); x.service.find(x.a).syncedAt = 0;
+  x.service.syncAll = async () => x.engine.pause(x.w.id);
+  await start(x); assert.equal(x.w.status, 'paused'); assert.equal(x.engine.timer, null); assert.deepEqual(x.platform.log, []);
 });
 
-test('automatic target prioritizes active tasks, filters old, completed, handled and out-of-scope work', () => {
-  const cwd = path.resolve('project'), now = Math.floor(Date.now() / 1000);
-  const entry = (id, status, time) => ({ thread: { id, cwd, updatedAt: time }, turn: { id: id + '-turn', status, startedAt: time } });
-  const items = [entry('completed', 'completed', now), entry('interrupted', 'interrupted', now - 1), entry('active', 'inProgress', now - 10)];
-  assert.equal(selectAutomaticTarget(items).thread.id, 'active');
-  assert.equal(selectAutomaticTarget(items.slice(0, 2)).thread.id, 'interrupted');
-  assert.equal(selectAutomaticTarget([items[0]]), null);
-  assert.equal(selectAutomaticTarget([items[1]], { after: now * 1000 }), null);
-  assert.equal(selectAutomaticTarget([items[1]], { scope: path.resolve('other') }), null);
-  assert.equal(selectAutomaticTarget([items[1]], { handled: ['interrupted:interrupted-turn'] }), null);
-  assert.equal(pendingExecution({}, { status: { activeFlags: ['waitingOnApproval'] } }), true);
-});
-
-test('legacy workflows stopped by compatibility errors migrate to active desktop monitoring; user-paused workflows stay paused', async t => {
-  const x = await setup(t, 'inProgress'); x.w.executor = undefined; x.w.status = 'needs_attention';
-  await x.engine.recover(); assert.equal(x.w.status, 'monitoring'); assert.equal(x.w.executor, 'desktop');
-  x.w.executor = undefined; x.w.status = 'paused'; await x.engine.recover(); assert.equal(x.w.status, 'paused');
-});
-
-test('pausing during queue storage cannot reactivate the monitor after an asynchronous handoff', async t => {
-  const x = await setup(t); const history = x.engine.withHistory.bind(x.engine); let count = 0;
-  x.engine.withHistory = async operation => history(async rpc => {
-    const original = rpc.call.bind(rpc);
-    rpc.call = async (method, params) => { const value = await original(method, params); if (method === 'thread/queue/add' && count++ === 0) await x.engine.pause(x.w.id); return value; };
+test('pausing before queue submission leaves no automatic message or implicit wake', async t => {
+  const x = await setup(t); const base = x.engine.withHistory.bind(x.engine); let paused = false;
+  x.engine.withHistory = operation => base(async rpc => {
+    const call = rpc.call.bind(rpc);
+    rpc.call = async (method, params) => { const value = await call(method, params); if (!paused && method === 'thread/queue/list' && x.w.dispatchId) { paused = true; await x.engine.pause(x.w.id); } return value; };
     return operation(rpc);
   });
-  await start(x); assert.equal(x.w.status, 'paused'); assert.equal(x.engine.timer, null);
+  await start(x); assert.equal(x.w.status, 'paused'); assert.equal(x.Rpc.queue.length, 0); assert.equal(x.platform.log.length, 0);
+});
+
+test('open original thread only navigates to its exact local ID and does not submit messages', async t => {
+  const x = await setup(t, 'inProgress'); await start(x); await x.engine.open(x.w.id);
+  assert.equal(x.platform.log[0].threadId, id); assert.equal(x.platform.log[0].wake, false);
+  assert.equal(x.Rpc.queue.length, 0); assert.equal(x.service.switches, 0);
 });

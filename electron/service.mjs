@@ -223,6 +223,7 @@ export class AccountService extends EventEmitter {
     if (exe !== settings.desktopPath) settings.desktopPath = exe;
     if (!exe) throw new Error('请先在设置中选择 Codex / ChatGPT 桌面程序，以便确认它已退出。');
     await access(exe);
+    if (workflowId && (await this.target())?.identity === account.identity) throw new Error('自动工作流不得重新切换到当前同一个账号。');
     const running = await this.platform.desktopRunning(exe);
     if (running && !restart) throw new Error('客户端仍在运行，请退出后切换，或使用「切换并重启」。');
     if (running) await this.platform.closeDesktop(exe);

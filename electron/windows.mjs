@@ -1,6 +1,6 @@
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
-import { access, readdir, stat } from 'node:fs/promises';
+import { access, readdir, stat, readFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 const exec = promisify(execFile);
@@ -97,13 +97,29 @@ export async function closeDesktop(executable) {
 }
 export function desktopLinks(threadId) {
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(threadId || '')) throw new Error('官方客户端会话 ID 无效。');
-  return [`codex://threads/wake/${threadId}`, `codex://threads/${threadId}`];
+  return [`codex://threads/wake/${threadId}`, `codex://threads/${threadId}?hostId=local`];
 }
-export async function launchDesktop(executable, { threadId, home } = {}) {
+export async function threadWriters(home) {
+  if (process.platform !== 'win32') return { busy: [], unknown: true };
+  const directory = path.join(home, 'thread-writer-locks');
+  let names;
+  try { names = await readdir(directory); }
+  catch { return { busy: [], unknown: true }; }
+  const busy = []; let unknown = false;
+  for (const name of names.filter(n => /^[0-9a-f-]{36}\.lock$/i.test(n))) {
+    try { await readFile(path.join(directory, name)); }
+    catch (error) {
+      if (error.code === 'EBUSY') busy.push(name.slice(0, -5));
+      else if (error.code !== 'ENOENT') unknown = true;
+    }
+  }
+  return { busy, unknown };
+}
+export async function launchDesktop(executable, { threadId, home, wake = true } = {}) {
   await access(executable);
   const env = { ...process.env, ...(home ? { CODEX_HOME: home } : {}) };
   for (const key of ['OPENAI_API_KEY', 'CODEX_API_KEY', 'CODEX_ACCESS_TOKEN', 'ACCESS_TOKEN']) delete env[key];
-  const links = threadId ? desktopLinks(threadId) : [];
+  const links = threadId ? desktopLinks(threadId).slice(wake ? 0 : 1) : [];
   const child = spawn(executable, [], { env, detached: true, stdio: 'ignore', windowsHide: false });
   await new Promise((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
   child.unref();
