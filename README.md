@@ -2,11 +2,13 @@
 
 Windows 独立桌面账号管理器，使用 **Electron + React + TypeScript**。通过本机 Codex CLI 的官方 App Server 登录、查询额度；通过本地登录文件切换目标客户端账号。
 
-当前版本：**0.3.0**。默认提供全自动任务跟随：活动任务优先；没有活动任务时恢复最近中断的工作，额度耗尽时自动换号并续接原会话。
+当前版本：**0.3.1**。默认提供全自动任务跟随：活动任务优先；没有活动任务时恢复最近中断的工作，额度耗尽时自动换号并续接原会话。
+
+0.3.1 修正 Windows 本地界面文件 URL 的构造和导航校验，启动日志保存在用户数据目录的 `startup.log`。主界面从应用根目录定位，路径包含空格、中文或 URL 特殊字符时也会正确编码；加载失败会短暂重试一次。
 
 ## 使用
 
-可直接运行 `release/0.3.0/win-unpacked/CodexAccountDeck.exe`，或使用 `release/0.3.0/` 中生成的安装包。开发环境：
+可直接运行 `release/0.3.1/win-unpacked/CodexAccountDeck.exe`，或使用 `release/0.3.1/` 中生成的安装包。开发环境：
 
 ```powershell
 npm ci

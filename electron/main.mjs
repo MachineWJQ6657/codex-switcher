@@ -6,6 +6,8 @@ import { readFile, stat, copyFile, mkdir } from 'node:fs/promises';
 import { AccountService } from './service.mjs';
 import { discoverCli, discoverDesktop } from './windows.mjs';
 import { safeError } from './core.mjs';
+import { rendererTarget, permittedRendererURL } from './renderer.mjs';
+import { appendFileSync, mkdirSync } from 'node:fs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 // This dashboard has no GPU-heavy content; software rendering avoids a large idle GPU allocation.
@@ -15,10 +17,17 @@ const legacyDirectory = app.getPath('userData');
 const profileDirectory = app.commandLine.getSwitchValue('user-data-dir');
 app.setPath('userData', profileDirectory && path.isAbsolute(profileDirectory) ? profileDirectory : path.join(app.getPath('appData'), 'codex-account-deck'));
 if (smoke) app.setPath('userData', path.join(os.tmpdir(), 'codex-deck-ui-test'));
+function startupLog(stage, error = '') {
+  try {
+    mkdirSync(app.getPath('userData'), { recursive: true });
+    appendFileSync(path.join(app.getPath('userData'), 'startup.log'), `${new Date().toISOString()} ${stage} ${safeError(error, 1000)}\n`, { mode: 0o600 });
+  } catch { /* A diagnostic failure must not prevent startup. */ }
+}
 if (!app.requestSingleInstanceLock()) { app.quit(); } else {
   let win, service, quitting = false;
   app.on('second-instance', () => { if (win) { win.show(); win.focus(); } });
   app.whenReady().then(async () => {
+  startupLog('starting', `version=${app.getVersion()}`);
   // Preserve existing encrypted data if an older build derived userData from a different product name.
   if (!profileDirectory && !smoke && legacyDirectory !== app.getPath('userData')) {
     await mkdir(app.getPath('userData'), { recursive: true });
@@ -38,7 +47,8 @@ if (!app.requestSingleInstanceLock()) { app.quit(); } else {
       title: 'Codex Account Deck', backgroundColor: '#f6f8fa', autoHideMenuBar: true, icon: path.join(here, '..', 'resources', 'icon.png'),
       webPreferences: { preload: path.join(here, 'preload.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: true, backgroundThrottling: !smoke } });
     const devUrl = !app.isPackaged && process.env.ACCOUNT_DECK_DEV_URL;
-    const allowed = url => devUrl ? new URL(url).origin === new URL(devUrl).origin : url === new URL('../dist/index.html', import.meta.url).href;
+    const renderer = rendererTarget(app.getAppPath());
+    const allowed = url => permittedRendererURL(url, renderer, devUrl || null);
     win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
     win.webContents.on('will-navigate', (event, url) => { if (!allowed(url)) event.preventDefault(); });
     win.webContents.session.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
@@ -95,7 +105,19 @@ if (!app.requestSingleInstanceLock()) { app.quit(); } else {
         return { ok: true, value };
       } catch (e) { return { ok: false, error: safeError(e) }; }
     });
-    if (devUrl) await win.loadURL(devUrl); else await win.loadFile(path.join(here, '..', 'dist', 'index.html'));
+    win.webContents.on('did-fail-load', (_event, code, description, url, isMainFrame) => { if (isMainFrame) startupLog('renderer-load-failed', `${code} ${description} ${url}`); });
+    if (devUrl) await win.loadURL(devUrl);
+    else {
+      await stat(renderer.file);
+      startupLog('renderer-url', renderer.url);
+      try { await win.loadURL(renderer.url); }
+      catch (error) {
+        startupLog('renderer-first-attempt', error);
+        await new Promise(resolve => setTimeout(resolve, 300));
+        await win.loadURL(renderer.url);
+      }
+    }
+    startupLog('ready');
     if (!smoke && service.data.accounts.length) service.syncAll().catch(() => {});
     app.on('before-quit', event => {
       if (quitting) return;
@@ -104,7 +126,7 @@ if (!app.requestSingleInstanceLock()) { app.quit(); } else {
     });
   }
   app.on('window-all-closed', () => app.quit());
-  }).catch(error => { dialog.showErrorBox('启动失败', safeError(error)); app.quit(); });
+  }).catch(error => { startupLog('fatal', error); dialog.showErrorBox('启动失败', `${safeError(error)}\n\n诊断日志：${path.join(app.getPath('userData'), 'startup.log')}`); app.quit(); });
 }
 async function openAuth(value) {
   const url = new URL(value);
