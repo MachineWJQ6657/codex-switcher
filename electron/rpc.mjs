@@ -45,7 +45,7 @@ export class CodexRpc extends EventEmitter {
     });
   }
   async initialize() {
-    await this.call('initialize', { clientInfo: { name: 'codex_account_deck', title: 'Codex Account Deck', version: '0.3.1' }, capabilities: { experimentalApi: true } });
+    await this.call('initialize', { clientInfo: { name: 'codex_account_deck', title: 'Codex Account Deck', version: '0.4.0' }, capabilities: { experimentalApi: true } });
     this.send({ method: 'initialized', params: {} });
   }
   close() {

@@ -161,7 +161,10 @@ export class AccountService extends EventEmitter {
     this.publish();
   }
   syncAll(onlyId, dueOnly = false) {
-    if (this.syncPromise) return this.syncPromise;
+    if (this.syncPromise) {
+      // An unrelated in-flight sync must not silently swallow a workflow's current-account request.
+      return this.syncPromise.then(() => this.syncAll(onlyId, dueOnly));
+    }
     this.syncPromise = this.performSync(onlyId, dueOnly).finally(() => { this.syncPromise = null; });
     return this.syncPromise;
   }

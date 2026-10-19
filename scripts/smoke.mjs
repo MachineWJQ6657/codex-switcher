@@ -49,9 +49,9 @@ for (const empty of [false, true]) {
     await page.getByRole('textbox', { name: '自动接力项目范围' }).fill('D:\\Projects\\sample');
     await page.getByRole('button', { name: '启用全自动接力' }).waitFor();
     await page.screenshot({ path: path.join(output, empty ? 'workflow-auto-empty.png' : 'workflow-auto.png'), fullPage: true });
-    await page.getByRole('combobox', { name: '工作流运行方式' }).selectOption('new');
-    await page.getByRole('textbox', { name: '项目目录' }).fill('D:\\Projects\\sample');
-    await page.getByRole('textbox', { name: '任务内容' }).fill('完成项目中剩余的任务，并运行检查。');
+    await page.getByRole('combobox', { name: '工作流运行方式' }).selectOption('existing');
+    await page.getByRole('button', { name: '读取本地会话' }).waitFor();
+    assert.equal(await page.locator('option[value="new"]').count(), 0);
     await page.screenshot({ path: path.join(output, empty ? 'workflow-form-empty.png' : 'workflow-form.png'), fullPage: true });
     await page.getByRole('button', { name: '取消', exact: true }).click();
     await page.getByRole('button', { name: '客户端设置', exact: true }).click();

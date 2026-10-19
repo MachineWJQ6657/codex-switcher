@@ -95,9 +95,19 @@ export async function closeDesktop(executable) {
   `, [executable]);
   if (result !== 'closed') throw new Error('目标客户端进程树未能退出，请检查权限或手动退出后重试。登录状态尚未修改。');
 }
-export async function launchDesktop(executable) {
+export function desktopLinks(threadId) {
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(threadId || '')) throw new Error('官方客户端会话 ID 无效。');
+  return [`codex://threads/wake/${threadId}`, `codex://threads/${threadId}`];
+}
+export async function launchDesktop(executable, { threadId, home } = {}) {
   await access(executable);
-  const child = spawn(executable, [], { detached: true, stdio: 'ignore', windowsHide: false });
+  const env = { ...process.env, ...(home ? { CODEX_HOME: home } : {}) };
+  for (const key of ['OPENAI_API_KEY', 'CODEX_API_KEY', 'CODEX_ACCESS_TOKEN', 'ACCESS_TOKEN']) delete env[key];
+  const links = threadId ? desktopLinks(threadId) : [];
+  const child = spawn(executable, [], { env, detached: true, stdio: 'ignore', windowsHide: false });
   await new Promise((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
   child.unref();
+  // Windows Store activation does not reliably forward argv to the existing desktop.
+  // Dispatch through the registered URI handler, which delivers OS protocol activation.
+  for (const link of links) await powershell('Start-Process -FilePath $env:DECK_TARGET_EXE -ErrorAction Stop', [link]);
 }

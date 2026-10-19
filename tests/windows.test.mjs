@@ -4,7 +4,13 @@ import { copyFile, mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import os from 'node:os';
-import { desktopRunning, closeDesktop } from '../electron/windows.mjs';
+import { desktopRunning, closeDesktop, desktopLinks } from '../electron/windows.mjs';
+
+test('official desktop launch opens the same thread and wakes its existing queue without prompt injection', () => {
+  const id = '01a15651-9fa2-7291-a6ff-b9def0813806';
+  assert.deepEqual(desktopLinks(id), [`codex://threads/wake/${id}`, `codex://threads/${id}`]);
+  assert.throws(() => desktopLinks('id?prompt=unrelated'), /无效/);
+});
 
 test('Windows closes a windowless target and descendant, keeps unrelated processes alive', { skip: process.platform !== 'win32', timeout: 25000 }, async t => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'deck-windows-'));

@@ -116,3 +116,13 @@ test('official installation paths follow updates, custom overrides stay local an
   assert.equal(restored.accounts[0].id, id); assert.equal(restored.accounts[0].auth.tokens.refresh_token, 'fixture-refresh');
   assert.equal(restored.settings.cliPath, custom);
 });
+
+test('an in-flight sync for one account cannot swallow a simultaneous current-account workflow refresh', async t => {
+  const { service } = await setup(t);
+  let release; const gate = new Promise(resolve => { release = resolve; }); const requests = [];
+  service.performSync = async ids => { requests.push(ids); if (requests.length === 1) await gate; };
+  const background = service.syncAll(['inactive-account']);
+  const workflow = service.syncAll(['current-account']);
+  release(); await Promise.all([background, workflow]);
+  assert.deepEqual(requests, [['inactive-account'], ['current-account']]);
+});
