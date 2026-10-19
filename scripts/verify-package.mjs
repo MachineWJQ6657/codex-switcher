@@ -6,7 +6,7 @@ import os from 'node:os';
 const env = { ...process.env };
 delete env.ELECTRON_RUN_AS_NODE; delete env.ACCOUNT_DECK_DEV_URL; delete env.ACCOUNT_DECK_SMOKE;
 const profile = await mkdtemp(path.join(os.tmpdir(), 'deck-package-check-'));
-const application = await electron.launch({ executablePath: path.resolve('release/0.2.0/win-unpacked/CodexAccountDeck.exe'), args: [`--user-data-dir=${profile}`], env, timeout: 30000 });
+const application = await electron.launch({ executablePath: path.resolve('release/0.3.0/win-unpacked/CodexAccountDeck.exe'), args: [`--user-data-dir=${profile}`], env, timeout: 30000 });
 try {
   const page = await application.firstWindow({ timeout: 30000 });
   await page.getByRole('heading', { name: '账号总览' }).waitFor();
@@ -21,7 +21,7 @@ try {
   assert.ok(await page.evaluate(async () => (await window.deck.snapshot()).ok));
   await page.getByRole('button', { name: '自动工作流', exact: true }).click();
   await page.getByRole('heading', { name: '自动工作流' }).waitFor();
-  const asar = await stat(path.resolve('release/0.2.0/win-unpacked/resources/app.asar'));
+  const asar = await stat(path.resolve('release/0.3.0/win-unpacked/resources/app.asar'));
   await new Promise(resolve => setTimeout(resolve, 8000));
   const first = await application.evaluate(({ app }) => app.getAppMetrics().reduce((sum, p) => sum + p.cpu.cumulativeCPUUsage, 0));
   const started = performance.now(); await new Promise(resolve => setTimeout(resolve, 5000));

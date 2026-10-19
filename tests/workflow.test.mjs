@@ -5,7 +5,7 @@ import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { AccountService } from '../electron/service.mjs';
-import { quotaState, quotaError } from '../electron/workflow.mjs';
+import { quotaState, quotaError, selectAutomaticTarget, pendingExecution } from '../electron/workflow.mjs';
 import { fixtureAuth, testCrypto } from './helpers.mjs';
 async function until(fn) { for (let i = 0; i < 100; i++) { if (fn()) return; await new Promise(r => setTimeout(r, 10)); } throw new Error('condition timed out'); }
 async function setup(t) {
@@ -14,7 +14,7 @@ async function setup(t) {
   const exe = path.join(root, 'fixture.exe'); await writeFile(exe, 'test');
   class Rpc extends EventEmitter {
     static instances = []; static last = { id: 'old-turn', status: 'failed', error: { codexErrorInfo: 'usageLimitExceeded' } };
-    static dispatchFails = false;
+    static dispatchFails = false; static inventory = []; static turns = new Map(); static lookups = 0;
     constructor() { super(); this.calls = []; this.sent = []; Rpc.instances.push(this); }
     async initialize() {}
     async close() { this.closed = true; this.emit('closed'); }
@@ -22,7 +22,8 @@ async function setup(t) {
     async call(method, params) {
       this.calls.push({ method, params });
       if (method === 'thread/read') return { thread: { id: 'original-thread', cwd: home } };
-      if (method === 'thread/turns/list') return { data: [Rpc.last] };
+      if (method === 'thread/list') return { data: Rpc.inventory };
+      if (method === 'thread/turns/list') { Rpc.lookups++; return { data: [Rpc.turns.get(params.threadId) || Rpc.last] }; }
       if (method === 'thread/resume') return { thread: { id: params.threadId } };
       if (method === 'thread/start') return { thread: { id: 'new-thread' } };
       if (method === 'turn/start') { if (Rpc.dispatchFails) throw new Error('transport timeout'); return { turn: { id: `turn-${Rpc.instances.length}`, status: 'inProgress' } }; }
@@ -110,4 +111,91 @@ test('idle and executing workflows have no polling timer; incomplete approval pr
   await until(() => w.status === 'approval');
   assert.equal(engine.snapshot()[0].approval.canAccept, false);
   await assert.rejects(() => engine.approve(w.id, 99, true), /未提供/);
+});
+function entry(id, cwd, status, time, error = null) {
+  return { thread: { id, cwd, name: id, updatedAt: time, originator: 'Codex Desktop' }, turn: { id: `${id}-turn`, status, startedAt: time, completedAt: status === 'inProgress' ? null : time, error, items: [] } };
+}
+test('automatic target prioritizes activity, then the most recent interruption; excludes completed, old and out-of-scope work', () => {
+  const cwd = path.resolve('project'), now = Math.floor(Date.now() / 1000);
+  const items = [entry('completed', cwd, 'completed', now), entry('recent-paused', cwd, 'interrupted', now - 1), entry('active', cwd, 'inProgress', now - 10)];
+  assert.equal(selectAutomaticTarget(items).thread.id, 'active');
+  assert.equal(selectAutomaticTarget(items.slice(0, 2)).thread.id, 'recent-paused');
+  assert.equal(selectAutomaticTarget([items[0]]), null);
+  assert.equal(selectAutomaticTarget([items[1]], { after: now * 1000 }), null);
+  assert.equal(selectAutomaticTarget([items[1]], { scope: path.resolve('another-project') }), null);
+  assert.equal(selectAutomaticTarget([items[1]], { handled: ['recent-paused:recent-paused-turn'] }), null);
+  const old = entry('old', cwd, 'interrupted', now - 100000); old.thread.updatedAt = now;
+  assert.equal(selectAutomaticTarget([old], { after: (now - 86400) * 1000 }), null);
+  assert.equal(pendingExecution({ items: [{ type: 'commandExecution', status: 'inProgress' }] }), true);
+  assert.equal(pendingExecution({}, { status: { activeFlags: ['waitingOnApproval'] } }), true);
+});
+async function autoSetup(t, status = 'interrupted') {
+  const setupResult = await setup(t); const { engine, w, home, Rpc } = setupResult;
+  const item = entry('auto-original', home, status, Math.floor(Date.now() / 1000) - 10, status === 'failed' ? { codexErrorInfo: 'usageLimitExceeded' } : null);
+  Rpc.inventory = [item.thread]; Rpc.turns.set(item.thread.id, item.turn);
+  await engine.remove(w.id);
+  const id = await engine.create({ name: 'automatic', mode: 'auto', accountIds: [setupResult.a, setupResult.b], cwd: '' });
+  return { ...setupResult, w: engine.find(id), item };
+}
+test('without an active task automatic mode resumes the latest interrupted work without a manually selected thread', async t => {
+  const { engine, w, item, a } = await autoSetup(t);
+  await engine.start(w.id); await until(() => w.status === 'running' && !engine.busy);
+  assert.equal(w.threadId, item.thread.id); assert.equal(w.cwd, item.thread.cwd); assert.equal(w.accountId, a);
+  const rpc = engine.runner.rpc;
+  assert.equal(rpc.calls.find(x => x.method === 'thread/resume').params.threadId, item.thread.id);
+  assert.match(rpc.calls.find(x => x.method === 'turn/start').params.input[0].text, /中断且尚未完成/);
+  rpc.emit('notification', { method: 'turn/completed', params: { threadId: w.threadId, turn: { id: w.turnId, status: 'completed' } } });
+  await until(() => w.status === 'monitoring'); assert.equal(w.completedCount, 1); assert.equal(w.threadId, null);
+  assert.ok(w.handledTurns.includes(`${item.thread.id}:${item.turn.id}`));
+});
+test('active task is followed until quota is exhausted, then switches and resumes its original thread', async t => {
+  const { engine, w, a, b, quota, item, Rpc } = await autoSetup(t, 'inProgress');
+  await engine.start(w.id); await until(() => !engine.busy); assert.equal(w.status, 'monitoring'); assert.equal(engine.runner, null);
+  assert.equal(w.observedTarget.threadId, item.thread.id);
+  quota(a, 0); engine.turnCache.clear(); await engine.tick();
+  assert.equal(w.status, 'running'); assert.equal(w.accountId, b); assert.equal(w.threadId, item.thread.id); assert.equal(w.switchCount, 1);
+  assert.ok(Rpc.instances.some(r => r.calls.some(c => c.method === 'thread/resume' && c.params.threadId === item.thread.id)));
+});
+test('automatic takeover waits for a running tool and does not pick an older interrupted task instead', async t => {
+  const { engine, w, a, quota, item } = await autoSetup(t, 'inProgress');
+  quota(a, 0); item.turn.items = [{ type: 'commandExecution', status: 'inProgress' }];
+  await engine.start(w.id); await until(() => !engine.busy);
+  assert.equal(w.status, 'monitoring'); assert.equal(engine.runner, null); assert.match(w.message, /工具/);
+});
+test('completed-after-selection race does not send another continue request', async t => {
+  const { engine, w, item, Rpc } = await autoSetup(t);
+  const original = engine.automaticTarget.bind(engine);
+  engine.automaticTarget = async target => { const result = await original(target); Rpc.turns.set(item.thread.id, { ...item.turn, status: 'completed' }); return result; };
+  await engine.start(w.id); await until(() => !engine.busy);
+  assert.equal(w.status, 'monitoring'); assert.equal(engine.runner, null);
+  assert.equal(Rpc.instances.filter(r => r.calls.some(c => c.method === 'turn/start')).length, 0);
+});
+test('automatic selection reuses unchanged turn metadata and skips completed conversations', async t => {
+  const { engine, w, item, Rpc } = await autoSetup(t, 'completed');
+  assert.equal(await engine.automaticTarget(w), null);
+  const lookups = Rpc.lookups; assert.equal(await engine.automaticTarget(w), null); assert.equal(Rpc.lookups, lookups);
+  assert.equal(item.turn.status, 'completed');
+});
+test('an independent CLI active turn is never duplicated by automatic desktop takeover', async t => {
+  const { engine, w, a, quota, item } = await autoSetup(t, 'inProgress');
+  quota(a, 0); item.thread.originator = 'codex_cli_rs';
+  await engine.start(w.id); await until(() => !engine.busy);
+  assert.equal(w.status, 'monitoring'); assert.equal(engine.runner, null); assert.match(w.message, /独立 CLI/);
+});
+test('automatic continuation recovers a transient stream interruption but excludes authentication and policy failures', () => {
+  const cwd = path.resolve('project'), now = Math.floor(Date.now() / 1000);
+  const interrupted = entry('stream-failed', cwd, 'failed', now, { codexErrorInfo: { responseStreamDisconnected: { httpStatusCode: 502 } } });
+  assert.equal(selectAutomaticTarget([interrupted]).thread.id, 'stream-failed');
+  for (const kind of ['unauthorized', 'contextWindowExceeded', 'cyberPolicy', 'sandboxError']) {
+    interrupted.turn.error = { codexErrorInfo: kind }; assert.equal(selectAutomaticTarget([interrupted]), null);
+  }
+});
+test('automatic worker retries an actual interruption with a delay instead of stopping the workflow', async t => {
+  const { engine, w, Rpc, item } = await autoSetup(t);
+  await engine.start(w.id); await until(() => w.status === 'running' && !engine.busy);
+  const interruptedTurn = { id: w.turnId, status: 'interrupted', items: [] };
+  Rpc.turns.set(item.thread.id, interruptedTurn);
+  engine.runner.rpc.emit('notification', { method: 'turn/completed', params: { threadId: w.threadId, turn: interruptedTurn } });
+  await until(() => w.status === 'waiting'); assert.equal(w.recoveryAttempts, 1); assert.ok(w.retryAfter > Date.now());
+  w.retryAfter = 0; await engine.tick(); assert.equal(w.status, 'running'); assert.equal(w.threadId, item.thread.id);
 });

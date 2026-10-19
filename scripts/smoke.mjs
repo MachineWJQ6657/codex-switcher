@@ -45,6 +45,10 @@ for (const empty of [false, true]) {
     await page.screenshot({ path: path.join(output, empty ? 'workflow-empty.png' : 'workflows.png'), fullPage: true });
     await page.getByRole('button', { name: '创建工作流', exact: true }).click();
     await page.getByRole('textbox', { name: '工作流名称' }).fill('界面测试任务');
+    assert.equal(await page.getByRole('combobox', { name: '工作流运行方式' }).inputValue(), 'auto');
+    await page.getByRole('textbox', { name: '自动接力项目范围' }).fill('D:\\Projects\\sample');
+    await page.getByRole('button', { name: '启用全自动接力' }).waitFor();
+    await page.screenshot({ path: path.join(output, empty ? 'workflow-auto-empty.png' : 'workflow-auto.png'), fullPage: true });
     await page.getByRole('combobox', { name: '工作流运行方式' }).selectOption('new');
     await page.getByRole('textbox', { name: '项目目录' }).fill('D:\\Projects\\sample');
     await page.getByRole('textbox', { name: '任务内容' }).fill('完成项目中剩余的任务，并运行检查。');
