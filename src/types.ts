@@ -5,7 +5,7 @@ export type Settings = { cliPath: string; desktopPath: string; codexHome: string
 export type Workflow = { id: string; name: string; mode: 'auto' | 'new' | 'existing'; cwd: string; threadId: string | null; prompt: string; accountIds: string[]; bucketId: string; status: string; message: string; accountId: string | null; turnId: string | null; switchCount: number; output: string; updatedAt: number; lastCheckedAt?: number; executor?: string; scope?: string; completedCount?: number; observedTarget?: { name: string; threadId: string; cwd: string; status: string } | null; source?: { name: string; threadId: string; turnId: string; status: string } | null; approval: { requestId: string | number; command: string; cwd: string; canAccept: boolean } | null };
 export type WorkflowInput = { name: string; mode: 'auto' | 'new' | 'existing'; cwd: string; prompt: string; threadId: string; bucketId: string; accountIds: string[] };
 export type LocalThread = { id: string; name: string; cwd: string };
-export type Snapshot = { workflows: Workflow[]; accounts: Account[]; settings: Settings; syncing: boolean; target: { email: string | null; accountId: string } | null; targetError: string | null;
+export type Snapshot = { switchState?: { stage: string; message: string; accountId: string; at: number; pid?: number } | null; workflows: Workflow[]; accounts: Account[]; settings: Settings; syncing: boolean; target: { email: string | null; accountId: string } | null; targetError: string | null;
   login: { label: string; url: string; code: string | null } | null; events: { id: string; at: number; message: string; type: string }[]; canRestore: boolean; platform: string };
 export type Result<T = unknown> = { ok: boolean; value?: T; error?: string };
 export interface DeckAPI {

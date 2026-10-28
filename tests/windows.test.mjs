@@ -4,7 +4,9 @@ import { copyFile, mkdtemp, writeFile, mkdir, rm } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import os from 'node:os';
-import { desktopRunning, closeDesktop, desktopLinks, threadWriters } from '../electron/windows.mjs';
+import { desktopRunning, closeDesktop, desktopLinks, threadWriters, desktopState, launchDesktop, waitForDesktop } from '../electron/windows.mjs';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 
 test('official desktop launch opens the same thread and wakes its existing queue without prompt injection', () => {
   const id = '01a15651-9fa2-7291-a6ff-b9def0813806';
@@ -38,4 +40,20 @@ test('Windows closes a windowless target and descendant, keeps unrelated process
   await closeDesktop(exe);
   assert.equal(await desktopRunning(exe), false);
   assert.doesNotThrow(() => process.kill(process.pid, 0));
+});
+
+test('real Windows restart verification requires a new responding window, not merely a successful spawn', { skip: process.platform !== 'win32', timeout: 45000 }, async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'deck-restart-'));
+  const exe = path.join(root, 'DeckRestartFixture.exe');
+  const source = path.join(root, 'fixture.cs');
+  await writeFile(source, 'using System;using System.Windows.Forms;public class DeckRestartFixture{[STAThread]public static void Main(){var f=new Form();f.Text="Account Deck restart test";f.Width=320;f.Height=100;var timer=new Timer();timer.Interval=30000;timer.Tick+=(s,e)=>f.Close();timer.Start();Application.Run(f);}}');
+  await promisify(execFile)('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', 'Add-Type -Path $env:DECK_FIXTURE_SOURCE -ReferencedAssemblies System.Windows.Forms,System.Drawing -OutputAssembly $env:DECK_FIXTURE_EXE -OutputType WindowsApplication'], { windowsHide: true, env: { ...process.env, DECK_FIXTURE_SOURCE: source, DECK_FIXTURE_EXE: exe } });
+  t.after(async () => { await closeDesktop(exe); await rm(root, { recursive: true, force: true }); });
+  const first = await launchDesktop(exe, { previousProcesses: [] });
+  assert.equal(first.window, true); const before = await desktopState(exe);
+  await assert.rejects(() => waitForDesktop(exe, before, { timeout: 1 }), /没有重新打开/);
+  await closeDesktop(exe);
+  const second = await launchDesktop(exe, { previousProcesses: before });
+  assert.equal(second.window, true);
+  assert.ok(!before.some(p => p.pid === second.pid && p.startedAt === second.startedAt));
 });

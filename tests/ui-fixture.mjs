@@ -12,7 +12,7 @@ export function installSmoke(service, defaults) {
   const empty = process.env.ACCOUNT_DECK_SMOKE_EMPTY === '1';
   service.vault.data = { accounts: [], settings: defaults };
   service.snapshot = async () => ({ accounts: empty ? [] : accounts, settings: defaults, syncing: false, target: null, targetError: null, login: null,
-    workflows: empty ? [] : [{ id: 'workflow-fixture', name: '产品项目自动接力', mode: 'existing', cwd: 'D:\\Projects\\sample-project', threadId: 'fixture-thread', prompt: '', accountIds: ['one', 'two'], bucketId: 'codex', status: 'monitoring', message: '后台监控已启用；达到限额后自动切号并重启官方客户端续接。', accountId: 'one', turnId: null, switchCount: 0, output: '', updatedAt: now, lastCheckedAt: now, executor: 'desktop', approval: null }],
+    workflows: empty ? [] : [{ id: 'workflow-fixture', name: '产品项目自动接力', mode: 'existing', cwd: 'D:\\Projects\\sample-project', threadId: 'fixture-thread', prompt: '', accountIds: ['one', 'two'], bucketId: 'codex', status: 'monitoring', message: '任务正在运行。', accountId: 'one', turnId: null, switchCount: 0, output: '', updatedAt: now, lastCheckedAt: now, executor: 'desktop', approval: null }],
     events: [{ id: 'event', at: now, message: '已保存账号「个人主力」', type: 'info' }], canRestore: false, platform: 'win32' });
   service.dispose = async () => {};
 }

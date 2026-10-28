@@ -67,10 +67,10 @@ export class WorkflowEngine {
   usesAccount(id) { return this.all.some(w => ACTIVE.has(w.status) && w.accountIds.includes(id)); }
   async recover() {
     for (const w of this.all) {
-      w.cooldowns ??= {}; w.handledTurns ??= []; w.attemptedSources ??= [];
+      w.cooldowns ??= {}; w.handledTurns ??= []; w.attemptedSources ??= []; w.bindings ??= {};
       if (w.policyVersion !== 2) {
         // Never silently reactivate a workflow that was stopped after an erroneous restart.
-        w.status = 'paused'; w.message = '误重启修复已安装，监控保持暂停；重新启用后只在确认原任务额度失败时切到其他账号。';
+        w.status = 'paused'; w.message = '工作流已暂停，点击启动即可使用。';
         w.policyVersion = 2; w.dispatchId = null; w.source = null; w.binding = null;
         if (w.mode === 'new' && w.threadId) w.mode = 'existing';
       } else if (ACTIVE.has(w.status)) w.status = w.dispatchId ? 'resuming' : 'monitoring';
@@ -119,7 +119,10 @@ export class WorkflowEngine {
       }
       const active = entries.filter(e => e.turn.status === 'inProgress');
       const pinned = (w.dispatchId || w.following || w.mode === 'existing') && w.threadId;
-      const selected = pinned ? entries.find(e => e.thread.id === w.threadId) : selectAutomaticTarget(entries, {
+      const failed = entries.filter(e => selectAutomaticTarget([e], { scope: w.scope, handled: [...(w.handledTurns || []), ...(w.attemptedSources || [])] }) && e.turn.status === 'failed' && quotaError(e.turn.error) &&
+        (w.bindings?.[e.thread.id]?.accountId === w.accountId || (e.turn.completedAt || e.turn.startedAt || 0) * 1000 >= (w.armedAt || Date.now())))
+        .sort((a,b) => (b.turn.completedAt || b.turn.startedAt || 0) - (a.turn.completedAt || a.turn.startedAt || 0));
+      const selected = pinned ? entries.find(e => e.thread.id === w.threadId) : failed[0] || selectAutomaticTarget(entries, {
         after: w.scanAfter ?? Date.now() - LOOKBACK_MS, scope: w.scope, handled: [...(w.handledTurns || []), ...(w.attemptedSources || [])] });
       return { selected, active, unknown: writers.unknown };
     });
@@ -146,7 +149,7 @@ export class WorkflowEngine {
     const w = { id: randomUUID(), name: input.name.trim().slice(0, 80), mode: input.mode, policyVersion: 2, executor: 'desktop', cwd, threadId,
       accountIds: input.accountIds, bucketId: /^[a-zA-Z0-9_.-]{1,100}$/.test(input.bucketId || '') ? input.bucketId : 'codex',
       status: 'paused', message: '已创建，等待启动。', accountId: null, turnId: null, dispatchId: null, cooldowns: {},
-      switchCount: 0, output: '', updatedAt: Date.now(), home: s.data.settings.codexHome, scope: input.mode === 'auto' ? cwd : '',
+      switchCount: 0, output: '', bindings: {}, updatedAt: Date.now(), home: s.data.settings.codexHome, scope: input.mode === 'auto' ? cwd : '',
       scanAfter: Date.now() - LOOKBACK_MS, handledTurns: [], attemptedSources: [], completedCount: 0 };
     s.data.workflows.push(w); await s.vault.save(); s.publish(); return w.id;
   }
@@ -156,14 +159,14 @@ export class WorkflowEngine {
     if (ACTIVE.has(w.status)) return;
     if (w.home !== this.service.data.settings.codexHome) throw new Error('目标 CODEX_HOME 已改变，请重新创建工作流。');
     if (!['auto', 'existing'].includes(w.mode)) throw new Error('请在官方客户端创建任务。');
-    this.generation++; w.retryAfter = 0; w.armedAt = Date.now(); w.binding = null;
+    this.generation++; w.retryAfter = 0; w.armedAt = Date.now(); w.binding = null; w.bindings = {};
     if (!w.dispatchId) { w.following = false; w.source = null; if (w.mode === 'auto') { w.threadId = null; w.cwd = w.scope || ''; } }
-    await this.persist(w, w.dispatchId ? 'resuming' : 'monitoring', '监控已启用；运行中的任务不会被打断，确认额度失败后才切换到其他账号。');
+    await this.persist(w, w.dispatchId ? 'resuming' : 'monitoring', '已开启自动接力。');
     this.tick().catch(() => {});
   }
   async pause(id) {
     const w = this.find(id); this.generation++;
-    await this.persist(w, 'paused', '自动监控已暂停，官方客户端保持运行。');
+    await this.persist(w, 'paused', '自动接力已暂停。');
     if (w.dispatchId && w.ownsDispatch) {
       const { data } = await this.history('thread/queue/list', { threadId: w.threadId, limit: 100 }).catch(() => ({ data: [] }));
       const queued = data.find(q => q.clientUserMessageId === w.dispatchId);
@@ -186,20 +189,20 @@ export class WorkflowEngine {
     if (result.turn) {
       w.turnId = result.turn.id; w.dispatchId = null; w.following = true;
       this.service.event(`已在原会话 ${w.threadId} 确认官方客户端接收继续指令`);
-      await this.persist(w, 'running', '已在原会话中确认继续指令，任务由官方客户端执行。'); return true;
+      await this.persist(w, 'running', '原任务已继续运行。'); return true;
     }
     if (result.latest && result.latest.id !== w.turnId) {
       // A different user turn is not acknowledgement of our queued message.
       if (result.queued && w.ownsDispatch) await this.history('thread/queue/delete', { threadId: w.threadId, queuedSubmissionId: result.queued.id });
       w.dispatchId = null;
-      await this.persist(w, 'needs_attention', '原会话出现其他新指令，已停止接力，不把其他回合当成恢复成功。'); return false;
+      await this.persist(w, 'needs_attention', '原会话收到了新消息，接力已停止。'); return false;
     }
     if (Date.now() - (w.dispatchAt || 0) > 90000 || (w.wakeAttempts || 0) >= 3) {
-      await this.persist(w, 'needs_attention', '尚未在原会话确认继续指令，已停止重试；不会再次切号或重启。'); return false;
+      await this.persist(w, 'needs_attention', 'ChatGPT 没有接收继续指令，接力已停止。'); return false;
     }
     const writers = await this.writers();
     if (result.queued && !writers.busy.includes(w.threadId) && Date.now() - (w.lastWakeAt || 0) >= 30000) await this.wakeDesktop(w);
-    await this.persist(w, 'resuming', '等待官方客户端接收原会话消息；尚未确认恢复，不重复切号或重启。'); return false;
+    await this.persist(w, 'resuming', '等待 ChatGPT 接收继续指令…'); return false;
   }
   async tick() {
     if (this.busy || this.service.stopping) return;
@@ -212,32 +215,40 @@ export class WorkflowEngine {
       const current = this.service.data.accounts.find(a => a.identity === target?.identity);
       if (w.dispatchId && !await this.reconcile(w, generation)) return;
       const state = await this.inspect(w);
+      if (current) {
+        w.accountId = current.id;
+        for (const entry of state.active) if (desktopOwnsActiveTask(entry.thread)) w.bindings[entry.thread.id] = { accountId: current.id, turnId: entry.turn.id, seenAt: Date.now() };
+      }
       if (generation !== this.generation) return;
       const selected = state.selected;
-      if (!selected) { await this.persist(w, 'monitoring', state.active.length ? '其他会话仍在运行，不恢复历史中断任务。' : '等待活动任务或已确认停止的中断任务。'); return; }
+      if (!selected) { await this.persist(w, 'monitoring', state.active.length ? '任务正在运行。' : '等待任务开始。'); return; }
       const { thread, turn } = selected;
       w.observedTarget = { name: thread.name || thread.preview?.slice(0, 60) || thread.id, threadId: thread.id, cwd: thread.cwd, status: turn.status };
       if (turn.status === 'inProgress') {
         if (current && desktopOwnsActiveTask(thread)) w.binding = { threadId: thread.id, turnId: turn.id, accountId: current.id };
         if (current && (!current.syncedAt || Date.now() - current.syncedAt >= 30000)) await this.service.syncAll([current.id]);
         if (generation !== this.generation) return;
-        await this.persist(w, w.following ? 'running' : 'monitoring', '原任务仍由运行进程持有，继续监控；不会因历史显示中断或面板显示 0% 而重启。'); return;
+        await this.persist(w, w.following ? 'running' : 'monitoring', '任务正在运行。'); return;
       }
       if (turn.status === 'completed') {
         if (w.following) w.completedCount++;
         if (w.mode === 'auto') { this.release(w); await this.persist(w, 'monitoring', '原会话已完成，继续监控。'); }
         else await this.persist(w, 'completed', '原会话已完成。'); return;
       }
-      if (state.unknown || state.active.some(e => e.thread.id !== thread.id)) { await this.persist(w, 'monitoring', '还有任务正在运行或运行状态无法确认，保持客户端和登录不变。'); return; }
-      if (!current) { await this.persist(w, 'waiting', '无法确认当前登录账号，保持客户端和登录不变。'); return; }
+      const quota = turn.status === 'failed' && quotaError(turn.error);
+      if (state.unknown || state.active.some(e => e.thread.id !== thread.id && (!quota || pendingExecution(e.turn, e.thread)))) {
+        await this.persist(w, 'monitoring', '等正在执行的任务结束后接力。'); return;
+      }
+      if (!current) { await this.persist(w, 'waiting', '找不到当前账号，请先导入登录。'); return; }
       await this.service.syncAll([current.id]);
       if (generation !== this.generation) return;
-      const quota = turn.status === 'failed' && quotaError(turn.error);
       const currentState = quotaState(current, w.bucketId, Date.now(), 60000);
       if (quota) {
-        const bound = w.binding?.threadId === thread.id && w.binding?.turnId === turn.id && w.binding?.accountId === current.id;
-        if (currentState !== 'exhausted' || !bound) {
-          await this.persist(w, 'monitoring', currentState !== 'exhausted' ? '历史额度错误与当前账号额度不符，不切号、不重启。' : '尚未确认额度失败属于当前账号正在监控的回合，保持客户端不变。'); return;
+        const bound = w.bindings[thread.id]?.accountId === current.id && w.bindings[thread.id]?.turnId === turn.id;
+        // A fresh failure after activation also counts; a fast quota rejection can happen between polls.
+        const recent = (turn.completedAt || turn.startedAt || 0) * 1000 >= Math.max(w.armedAt || Date.now(), Date.now() - 300000);
+        if (currentState !== 'exhausted' || (!bound && !recent)) {
+          await this.persist(w, 'monitoring', currentState !== 'exhausted' ? '当前账号还有额度，继续监控。' : '找到旧的限额记录，等待当前任务状态更新。'); return;
         }
         this.cooldown(w, current);
         for (const id of w.accountIds.filter(id => id !== current.id && (!w.cooldowns[id] || w.cooldowns[id] <= Date.now()))) {
@@ -245,15 +256,15 @@ export class WorkflowEngine {
           if (nextAccount(this.service.data.accounts, w, Date.now(), 60000, current)) break;
         }
         const next = nextAccount(this.service.data.accounts, w, Date.now(), 60000, current);
-        if (!next) { await this.persist(w, 'waiting', '没有其他可用账号，等待额度恢复；不会切回当前账号重启。'); return; }
-        if (Date.now() - (w.lastRestartAt || 0) < 120000) { await this.persist(w, 'waiting', '已触发重启间隔保护，稍后重新核对；不会连续重启。'); return; }
+        if (!next) { await this.persist(w, 'waiting', '账号额度已用完，等待恢复。'); return; }
+        if (Date.now() - (w.lastRestartAt || 0) < 120000) { await this.persist(w, 'waiting', '稍后重试切换。'); return; }
         await this.handoff(w, selected, current, next, generation);
       } else if (turn.status === 'interrupted' || (turn.status === 'failed' && transientInterruption(turn.error))) {
-        if (thread.writerBusy) { await this.persist(w, 'monitoring', '会话仍被运行进程持有，保持客户端不变。'); return; }
-        if (w.following) { await this.persist(w, 'needs_attention', '刚续接的原会话再次中断，已停止接力，避免重复干预。'); return; }
-        if (currentState !== 'available') { await this.persist(w, 'waiting', '当前账号额度未知或耗尽，但原任务没有确认额度失败；不会据此换号。'); return; }
+        if (thread.writerBusy) { await this.persist(w, 'monitoring', '任务正在运行。'); return; }
+        if (w.following) { await this.persist(w, 'needs_attention', '原任务再次中断，接力已停止。'); return; }
+        if (currentState !== 'available') { await this.persist(w, 'waiting', '正在刷新账号额度…'); return; }
         await this.handoff(w, selected, current, current, generation);
-      } else await this.persist(w, 'needs_attention', '原任务需要在官方客户端处理，保持登录和客户端不变。');
+      } else await this.persist(w, 'needs_attention', '请打开原会话查看任务消息。');
     } catch (error) {
       if (generation === this.generation) {
         const attempted = w.attemptedSources.includes(`${w.threadId}:${w.turnId}`);
@@ -269,14 +280,14 @@ export class WorkflowEngine {
   async handoff(w, selected, current, account, generation) {
     const s = this.service, { thread, turn } = selected;
     const source = `${thread.id}:${turn.id}`;
-    if (w.attemptedSources.includes(source)) { await this.persist(w, 'needs_attention', '这一回合已尝试接力，不重复提交或重启。'); return; }
+    if (w.attemptedSources.includes(source)) { await this.persist(w, 'needs_attention', '这次接力失败，请打开原会话查看。'); return; }
     const rotate = account.identity !== current.identity;
     if (!path.isAbsolute(thread.cwd || '') || !(await stat(thread.cwd)).isDirectory()) throw new Error('原项目目录不可用，已取消接力。');
     const fresh = await this.inspect({ ...w, threadId: thread.id, mode: 'existing' });
     const latest = fresh.selected;
     if (generation !== this.generation) return;
-    if (!latest || latest.turn.id !== turn.id || latest.turn.status === 'inProgress' || latest.turn.status === 'completed' || fresh.unknown || fresh.active.length) {
-      await this.persist(w, 'monitoring', '会话仍在运行或状态已变化，不提交继续指令、不重启。'); return;
+    if (!latest || latest.turn.id !== turn.id || latest.turn.status === 'inProgress' || latest.turn.status === 'completed' || fresh.unknown || fresh.active.some(e => !rotate || pendingExecution(e.turn, e.thread))) {
+      await this.persist(w, 'monitoring', '任务状态已更新，重新检查中…'); return;
     }
     if ((await s.target())?.identity !== current.identity) throw new Error('当前账号发生变化，已取消接力。');
     w.threadId = thread.id; w.cwd = thread.cwd; w.turnId = turn.id;
@@ -293,17 +304,19 @@ export class WorkflowEngine {
       w.lastRestartAt = Date.now();
       await this.persist(w, 'switching', `已确认原回合额度失败，准备切换到其他账号「${account.label}」。`);
       if (generation !== this.generation) return;
-      if (await s.platform.desktopRunning(exe)) await s.platform.closeDesktop(exe);
       this.desktopOwned = { threadId: thread.id, home: w.home };
       if (generation !== this.generation) return;
-      const after = await this.latestTurn(thread.id);
-      if (!after || after.id !== turn.id || after.status !== 'failed' || !quotaError(after.error)) throw new Error('退出时原回合已变化，已取消切换。');
-      if ((await s.target())?.identity !== current.identity) throw new Error('退出时登录已变化，已取消切换。');
-      await s.switchAccount(account.id, false, w.id); w.switchCount++;
+      await s.switchAccount(account.id, true, w.id, { threadId: thread.id, wake: false, beforeWrite: async () => {
+        if (generation !== this.generation) throw new Error('工作流已暂停。');
+        const after = await this.latestTurn(thread.id);
+        if (!after || after.id !== turn.id || after.status !== 'failed' || !quotaError(after.error)) throw new Error('原任务状态已更新，取消这次切换。');
+        if ((await s.target())?.identity !== current.identity) throw new Error('账号已被其他操作更改。');
+      } });
+      this.desktopOwned = null; w.switchCount++;
     }
     if (generation !== this.generation) return;
     w.accountId = account.id; w.dispatchId = randomUUID(); w.ownsDispatch = true; w.dispatchAt = Date.now(); w.wakeAttempts = 0;
-    await this.persist(w, 'resuming', rotate ? '已切到其他账号，正在打开并等待原会话接收指令。' : '只在原会话提交继续指令，账号和运行中的客户端保持不变。');
+    await this.persist(w, 'resuming', rotate ? '客户端已重启，正在继续原会话…' : '正在继续原会话…');
     const dispatchId = w.dispatchId;
     await this.withHistory(async rpc => {
       const { data } = await rpc.call('thread/queue/list', { threadId: w.threadId, limit: 100 });
@@ -315,7 +328,7 @@ export class WorkflowEngine {
     });
     if (generation !== this.generation) return;
     await this.wakeDesktop(w);
-    if (generation === this.generation) await this.persist(w, 'resuming', '已定位原会话，等待确认对应继续消息被官方客户端接收。');
+    if (generation === this.generation) await this.persist(w, 'resuming', '等待 ChatGPT 接收继续指令…');
   }
   async wakeDesktop(w) {
     w.lastWakeAt = Date.now(); w.wakeAttempts = (w.wakeAttempts || 0) + 1; await this.service.vault.save();

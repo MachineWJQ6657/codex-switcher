@@ -28,8 +28,8 @@ async function setup(t) {
   const root = await mkdtemp(path.join(os.tmpdir(), 'deck-service-'));
   const targetHome = path.join(root, 'target'); await mkdir(targetHome);
   const exe = path.join(root, 'fixture.exe'); await writeFile(exe, 'fixture');
-  const state = { running: false, launched: 0, closeFails: false };
-  const platform = { desktopRunning: async () => state.running, closeDesktop: async () => { if (state.closeFails) throw new Error('fixture busy'); state.running = false; }, launchDesktop: async () => { state.launched++; } };
+  const state = { running: false, launched: 0, closeFails: false, generation: 1 };
+  const platform = { desktopState: async () => state.running ? [{ pid: state.generation, startedAt: String(state.generation), window: true }] : [], desktopRunning: async () => state.running, closeDesktop: async () => { if (state.closeFails) throw new Error('fixture busy'); state.running = false; }, launchDesktop: async () => { state.launched++; state.generation++; return { pid: state.generation, window: true }; } };
   FakeRpc.fail = false; FakeRpc.instances = [];
   const service = new AccountService({ directory: path.join(root, 'data'), crypto: testCrypto(), defaults: { cliPath: exe, desktopPath: exe, codexHome: targetHome, autoSync: false, pollSeconds: 60 }, platform, Rpc: FakeRpc });
   await service.init();
@@ -125,4 +125,33 @@ test('an in-flight sync for one account cannot swallow a simultaneous current-ac
   const workflow = service.syncAll(['current-account']);
   release(); await Promise.all([background, workflow]);
   assert.deepEqual(requests, [['inactive-account'], ['current-account']]);
+});
+
+test('launcher returning without a new window is a failed switch, never success', async t => {
+  const { service, state } = await setup(t); const id = await service.importFile(fixtureAuth('other'));
+  service.platform.launchDesktop = async () => { state.launched++; return undefined; };
+  await assert.rejects(() => service.switchAccount(id, true), /没有重新打开/);
+  assert.equal(service.switchState.stage, 'failed');
+  assert.equal(service.data.events.some(e => e.message.startsWith('已重新打开客户端')), false);
+});
+
+test('client that stays running blocks credential replacement even when close returns successfully', async t => {
+  const { service, state, file } = await setup(t); const before = fixtureAuth(); await writeFile(file, before);
+  const id = await service.importFile(fixtureAuth('other')); state.running = true;
+  service.platform.closeDesktop = async () => {};
+  await assert.rejects(() => service.switchAccount(id, true), /还没退出/);
+  assert.equal(await readFile(file, 'utf8'), before); assert.equal(service.switchState.stage, 'failed');
+});
+
+test('client rewriting auth to another account on launch is a failed switch', async t => {
+  const { service, file } = await setup(t); const id = await service.importFile(fixtureAuth('other'));
+  service.platform.launchDesktop = async () => { await writeFile(file, fixtureAuth('unexpected')); return { pid: 5, window: true }; };
+  await assert.rejects(() => service.switchAccount(id, true), /没有成功/);
+  assert.equal(service.switchState.stage, 'failed');
+});
+
+test('file-only switching tells the user the client has not been opened', async t => {
+  const { service, state } = await setup(t); const id = await service.importFile(fixtureAuth('other'));
+  const result = await service.switchAccount(id, false);
+  assert.equal(result.restarted, false); assert.match(result.message, /还没打开/); assert.equal(state.launched, 0);
 });

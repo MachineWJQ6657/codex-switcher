@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events';
-import { mkdir, mkdtemp, readFile, readdir, rm, access } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, access, appendFile } from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { Vault, atomicWrite, parseAuth, normalizeLimits, publicAccount, safeError, SerialQueue, digest } from './core.mjs';
@@ -76,10 +76,14 @@ export class AccountService extends EventEmitter {
     try { current = await this.target(); } catch (error) { targetError = safeError(error); }
     return { accounts: this.data.accounts.map(a => publicAccount(a, current?.identity)), settings: this.data.settings,
       events: this.data.events.slice(0, 40), target: current ? { email: current.email, accountId: current.accountId } : null,
-      targetError, syncing: this.syncing, login: this.login ? { label: this.login.label, url: this.login.url, code: this.login.code } : null,
+      targetError, switchState: this.switchState ?? null, syncing: this.syncing, login: this.login ? { label: this.login.label, url: this.login.url, code: this.login.code } : null,
       canRestore: Boolean(this.data.backup), platform: process.platform, workflows: this.workflow.snapshot() };
   }
   publish() { this.emit('changed'); }
+  async switchStage(stage, message, accountId, detail = {}) {
+    this.switchState = { stage, message, accountId, at: Date.now(), ...detail }; this.publish();
+    await appendFile(path.join(this.directory, 'operations.log'), `${JSON.stringify(this.switchState)}\n`, { mode: 0o600 }).catch(() => {});
+  }
   event(message, type = 'info') { this.data.events.unshift({ id: randomUUID(), at: Date.now(), message, type }); this.data.events = this.data.events.slice(0, 80); }
   async put(raw, label = '') {
     const parsed = parseAuth(raw);
@@ -212,7 +216,8 @@ export class AccountService extends EventEmitter {
     if (store && store !== 'file') throw new Error(`目标使用 ${store} 凭据存储。请在目标 config.toml 中显式设置 cli_auth_credentials_store = "file"，然后重新登录并导入。`);
     if (/^\s*forced_chatgpt_workspace_id\s*=/m.test(text) || /^\s*forced_login_method\s*=\s*["']api["']/m.test(text)) throw new Error('目标配置限制了登录方式或工作空间，请先检查组织配置。');
   }
-  switchAccount(id, restart = true, workflowId = null) { return this.queue.run(async () => {
+  switchAccount(id, restart = true, workflowId = null, options = {}) { return this.queue.run(async () => {
+    try {
     this.workflow.assertOwnership(workflowId);
     if (workflowId && this.workflow.active?.id !== workflowId) throw new Error('工作流已暂停，切换已取消。');
     await this.refreshRuntimePaths();
@@ -224,9 +229,13 @@ export class AccountService extends EventEmitter {
     if (!exe) throw new Error('请先在设置中选择 Codex / ChatGPT 桌面程序，以便确认它已退出。');
     await access(exe);
     if (workflowId && (await this.target())?.identity === account.identity) throw new Error('自动工作流不得重新切换到当前同一个账号。');
-    const running = await this.platform.desktopRunning(exe);
+    const previousProcesses = await this.platform.desktopState(exe);
+    const running = previousProcesses.length > 0;
+    await this.switchStage('closing', running ? '正在退出客户端…' : '客户端已退出。', id);
     if (running && !restart) throw new Error('客户端仍在运行，请退出后切换，或使用「切换并重启」。');
     if (running) await this.platform.closeDesktop(exe);
+    if ((await this.platform.desktopState(exe)).length) throw new Error('客户端还没退出，账号没有切换。');
+    if (options.beforeWrite) await options.beforeWrite();
     if (workflowId && this.workflow.active?.id !== workflowId) throw new Error('工作流已暂停，切换已取消。');
     // Re-read after the desktop has flushed any refreshed credentials on exit.
     const previous = await this.target();
@@ -241,14 +250,25 @@ export class AccountService extends EventEmitter {
     // Compare immediately before replacement to detect another login changing the file.
     const latest = await this.target();
     if ((latest?.hash ?? null) !== (previous?.hash ?? null)) throw new Error('目标登录状态已被其他程序修改，请重试。');
+    await this.switchStage('writing', '正在更新登录文件…', id);
     await atomicWrite(file, JSON.stringify(account.auth));
     this.event(`已写入「${account.label}」的本地登录状态${restart ? '，准备重启客户端' : ''}`);
     await this.vault.save(); this.publish();
     if (restart) {
-      try { await this.platform.launchDesktop(exe); }
-      catch { this.event('登录状态已切换，但客户端启动失败，请手动打开或恢复上次切换。', 'error'); await this.vault.save(); this.publish(); throw new Error('登录状态已写入，但客户端启动失败。可手动打开客户端或恢复上次切换。'); }
+      await this.switchStage('starting', '正在重新打开客户端…', id);
+      const opened = await this.platform.launchDesktop(exe, { home: settings.codexHome, previousProcesses, threadId: options.threadId, wake: options.wake });
+      if (!opened?.window || !opened.pid) throw new Error('客户端没有重新打开。登录文件已更新，请重试“切换并重启”。');
+      if ((await this.target())?.identity !== account.identity) throw new Error('客户端启动后登录又变了，这次切换没有成功。');
+      await this.switchStage('restarted', '客户端已重新打开。', id, { pid: opened.pid });
+      this.event(`已重新打开客户端，登录文件使用「${account.label}」`); await this.vault.save();
+      return { message: `客户端已重新打开，登录文件已更新为「${account.label}」。`, restarted: true };
     }
-    return { message: '本地登录状态已切换。请在目标客户端核对账号；桌面应用兼容性取决于其登录存储方式。' };
+    await this.switchStage('file_updated', '登录文件已更新，客户端还没打开。', id);
+    return { message: '登录文件已更新，客户端还没打开。', restarted: false };
+    } catch (error) {
+      await this.switchStage('failed', safeError(error), id); this.event(`切换失败：${safeError(error)}`, 'error');
+      await this.vault.save(); throw error;
+    }
   }); }
   restore() { return this.queue.run(async () => {
     this.workflow.assertOwnership(null);

@@ -41,6 +41,22 @@ export async function desktopRunning(executable) {
   if (!executable || process.platform !== 'win32') return false;
   return (await powershell("$p = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path -eq $env:DECK_TARGET_EXE }); if ($p.Count -gt 0) { 'yes' }", [executable])) === 'yes';
 }
+export async function desktopState(executable) {
+  if (!executable || process.platform !== 'win32') throw new Error('找不到客户端程序。');
+  const result = await powershell(`$ErrorActionPreference = 'Stop'; @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path -eq $env:DECK_TARGET_EXE } | ForEach-Object { [PSCustomObject]@{ pid = $_.Id; startedAt = $_.StartTime.ToUniversalTime().ToString('o'); window = [bool]($_.MainWindowHandle -ne 0); responding = $_.Responding } }) | ConvertTo-Json -Compress`, [executable]);
+  return result ? [JSON.parse(result)].flat() : [];
+}
+export async function waitForDesktop(executable, previous = [], { timeout = 20000 } = {}) {
+  const deadline = Date.now() + timeout;
+  const old = new Set(previous.map(p => `${p.pid}:${p.startedAt}`));
+  do {
+    const state = await desktopState(executable);
+    const window = state.find(p => p.window && p.responding && !old.has(`${p.pid}:${p.startedAt}`));
+    if (window) return { pid: window.pid, startedAt: window.startedAt, window: true };
+    await new Promise(resolve => setTimeout(resolve, 500));
+  } while (Date.now() < deadline);
+  throw new Error('客户端没有重新打开。请重试“切换并重启”。');
+}
 export async function resolveDesktop(executable) {
   // Store app updates move the executable into a new versioned directory.
   if (/[/\\]OpenAI\.Codex_[^/\\]+[/\\]app[/\\](ChatGPT|Codex)\.exe$/i.test(executable)) {
@@ -115,15 +131,21 @@ export async function threadWriters(home) {
   }
   return { busy, unknown };
 }
-export async function launchDesktop(executable, { threadId, home, wake = true } = {}) {
+export async function launchDesktop(executable, { threadId, home, wake = true, previousProcesses = null } = {}) {
   await access(executable);
   const env = { ...process.env, ...(home ? { CODEX_HOME: home } : {}) };
   for (const key of ['OPENAI_API_KEY', 'CODEX_API_KEY', 'CODEX_ACCESS_TOKEN', 'ACCESS_TOKEN']) delete env[key];
   const links = threadId ? desktopLinks(threadId).slice(wake ? 0 : 1) : [];
-  const child = spawn(executable, [], { env, detached: true, stdio: 'ignore', windowsHide: false });
-  await new Promise((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
-  child.unref();
+  const before = await desktopState(executable);
+  if (!before.length || previousProcesses) {
+    const child = spawn(executable, [], { env, detached: true, stdio: 'ignore', windowsHide: false });
+    await new Promise((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
+    child.unref();
+  }
+  const opened = previousProcesses ? await waitForDesktop(executable, previousProcesses)
+    : before.find(p => p.window && p.responding) || await waitForDesktop(executable);
   // Windows Store activation does not reliably forward argv to the existing desktop.
   // Dispatch through the registered URI handler, which delivers OS protocol activation.
   for (const link of links) await powershell('Start-Process -FilePath $env:DECK_TARGET_EXE -ErrorAction Stop', [link]);
+  return { ...opened, window: true };
 }

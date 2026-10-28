@@ -36,9 +36,10 @@ async function setup(t, status = 'interrupted') {
   }
   const platform = { held: [], unknown: false, log: [], running: true,
     threadWriters: async () => ({ busy: [...platform.held], unknown: platform.unknown }),
+    desktopState: async () => platform.running ? [{ pid: 1, startedAt: 'fixture', window: true }] : [],
     desktopRunning: async () => platform.running,
     closeDesktop: async () => { platform.log.push('close'); platform.running = false; },
-    launchDesktop: async (_exe, options) => { platform.log.push({ launch: true, ...options }); platform.running = true; } };
+    launchDesktop: async (_exe, options) => { platform.log.push({ launch: true, ...options }); platform.running = true; return { pid: 2, window: true }; } };
   const service = new AccountService({ directory: path.join(root, 'data'), crypto: testCrypto(), defaults: { cliPath: exe, desktopPath: exe, codexHome: home, autoSync: false, pollSeconds: 3600, lowResource: true }, Rpc, platform });
   await service.init();
   const a = await service.importFile(fixtureAuth('first')), b = await service.importFile(fixtureAuth('second'));
@@ -92,12 +93,12 @@ test('quota switch requires observed original turn failure AND fresh zero, selec
 test('historical quota error with healthy current account never switches or restarts', async t => {
   const x = await setup(t, 'inProgress'); await start(x);
   x.Rpc.turn = { ...x.Rpc.turn, status: 'failed', error: { codexErrorInfo: 'usageLimitExceeded' } };
-  await x.engine.tick(); assert.equal(x.service.switches, 0); assert.deepEqual(x.platform.log, []); assert.match(x.w.message, /不符/);
+  await x.engine.tick(); assert.equal(x.service.switches, 0); assert.deepEqual(x.platform.log, []); assert.match(x.w.message, /还有额度/);
 });
 
 test('unobserved quota failure from an older account cannot be attributed to the current account', async t => {
   const x = await setup(t, 'failed'); x.Rpc.turn.error = { codexErrorInfo: 'usageLimitExceeded' }; x.quota(x.a, 0); await start(x);
-  assert.equal(x.service.switches, 0); assert.deepEqual(x.platform.log, []); assert.match(x.w.message, /尚未确认/);
+  assert.equal(x.service.switches, 0); assert.deepEqual(x.platform.log, []); assert.match(x.w.message, /旧的限额记录/);
 });
 
 test('same-account-only candidate pool waits without touching auth or restarting', async t => {
@@ -203,4 +204,25 @@ test('open original thread only navigates to its exact local ID and does not sub
   const x = await setup(t, 'inProgress'); await start(x); await x.engine.open(x.w.id);
   assert.equal(x.platform.log[0].threadId, id); assert.equal(x.platform.log[0].wake, false);
   assert.equal(x.Rpc.queue.length, 0); assert.equal(x.service.switches, 0);
+});
+
+test('all active tasks are bound to the account, quota failure on a nonselected task still triggers handoff', async t => {
+  const x = await setup(t, 'inProgress'); x.Rpc.threads.push({ ...x.thread, id: otherId });
+  x.Rpc.otherTurn = { id: 'second-original-turn', status: 'inProgress', items: [], startedAt: Math.floor(Date.now()/1000) - 5 };
+  await start(x); assert.equal(x.w.bindings[otherId].accountId, x.a);
+  x.quota(x.a, 0); x.Rpc.otherTurn = { ...x.Rpc.otherTurn, status: 'failed', error: { codexErrorInfo: 'usageLimitExceeded' } };
+  await x.engine.tick(); assert.equal(x.w.threadId, otherId); assert.equal(x.w.accountId, x.b); assert.equal(x.service.switches, 1);
+});
+
+test('quota failure arriving entirely between two polls is handled when fresh after activation', async t => {
+  const x = await setup(t, 'completed'); await start(x); x.quota(x.a, 0);
+  x.Rpc.turn = { id: 'new-fast-turn', status: 'failed', error: { codexErrorInfo: 'usageLimitExceeded' }, items: [], startedAt: Math.ceil(Date.now()/1000), completedAt: Math.ceil(Date.now()/1000) };
+  await x.engine.tick(); assert.equal(x.w.accountId, x.b); assert.equal(x.service.switches, 1); assert.equal(x.w.switchCount, 1);
+});
+
+test('failed desktop restart cannot increment switch count or say the original task was resumed', async t => {
+  const x = await setup(t, 'inProgress'); await start(x); x.quota(x.a, 0);
+  x.Rpc.turn = { ...x.Rpc.turn, status: 'failed', error: { codexErrorInfo: 'usageLimitExceeded' } };
+  x.platform.launchDesktop = async () => undefined;
+  await x.engine.tick(); assert.equal(x.w.switchCount, 0); assert.equal(x.w.status, 'needs_attention'); assert.equal(x.Rpc.queue.length, 0);
 });
